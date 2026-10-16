@@ -20,6 +20,11 @@ pub struct CancelledAdminEvent {
     pub data: (),
 }
 
+#[contractevent(topics = ["renounce"], data_format = "single-value")]
+pub struct RenouncedAdminEvent {
+    pub data: (),
+}
+
 #[contractevent(topics = ["pause"], data_format = "single-value")]
 pub struct PausedEvent {
     pub data: (),
@@ -551,7 +556,7 @@ impl DonationVault {
             .set(&DataKey::AdminRenounced, &true);
         extend_instance_ttl(&env);
 
-        env.events().publish((symbol_short!("renounce"),), ());
+        RenouncedAdminEvent { data: () }.publish(&env);
 
         Ok(())
     }
