@@ -1845,26 +1845,65 @@ fn renounce_admin_clears_admin_and_pending_proposal() {
 fn renounce_admin_disables_admin_gated_calls() {
     let s = setup();
     let admin = s.client.admin();
+    let new_admin = Address::generate(&s.env);
+    let treasury = Address::generate(&s.env);
 
     s.client.renounce_admin();
     assert_auth_required_from(&s, &admin, "renounce_admin");
 
-    // Admin-gated entry points must now fail cleanly rather than succeed.
-    assert!(s.client.try_pause().is_err());
-    assert!(s.client.try_unpause().is_err());
-    assert!(s
-        .client
-        .try_set_treasury(&Address::generate(&s.env))
-        .is_err());
-    assert!(s.client.try_clear_treasury().is_err());
-    assert!(s.client.try_set_fee_bps(&100).is_err());
-    assert!(s
-        .client
-        .try_propose_admin(&Address::generate(&s.env))
-        .is_err());
-    assert!(s.client.try_cancel_admin_proposal().is_err());
-    assert!(s.client.try_set_min_deposit(&1_000).is_err());
-    assert!(s.client.try_set_max_streams_per_donor(&5).is_err());
+    // Admin-gated entry points must fail specifically with AdminRenounced.
+    assert_eq!(s.client.try_pause(), Err(Ok(Error::AdminRenounced)));
+    assert_eq!(s.client.try_unpause(), Err(Ok(Error::AdminRenounced)));
+    assert_eq!(
+        s.client.try_set_treasury(&treasury),
+        Err(Ok(Error::AdminRenounced))
+    );
+    assert_eq!(s.client.try_clear_treasury(), Err(Ok(Error::AdminRenounced)));
+    assert_eq!(s.client.try_set_fee_bps(&100), Err(Ok(Error::AdminRenounced)));
+    assert_eq!(
+        s.client.try_propose_admin(&new_admin),
+        Err(Ok(Error::AdminRenounced))
+    );
+    assert_eq!(
+        s.client.try_cancel_admin_proposal(),
+        Err(Ok(Error::AdminRenounced))
+    );
+    assert_eq!(
+        s.client.try_set_min_deposit(&1_000),
+        Err(Ok(Error::AdminRenounced))
+    );
+    assert_eq!(
+        s.client.try_set_max_streams_per_donor(&5),
+        Err(Ok(Error::AdminRenounced))
+    );
+}
+
+#[test]
+fn renounce_admin_returns_admin_renounced_for_admin_init_propose_and_pause() {
+    let s = setup();
+    let admin = s.client.admin();
+    let candidate = Address::generate(&s.env);
+
+    s.client.renounce_admin();
+    assert_auth_required_from(&s, &admin, "renounce_admin");
+
+    // admin() returns AdminRenounced
+    assert_eq!(s.client.try_admin(), Err(Ok(Error::AdminRenounced)));
+
+    // init() (re-initialisation after renounce) returns AdminRenounced
+    assert_eq!(
+        s.client.try_init(&candidate),
+        Err(Ok(Error::AdminRenounced))
+    );
+
+    // propose_admin() returns AdminRenounced
+    assert_eq!(
+        s.client.try_propose_admin(&candidate),
+        Err(Ok(Error::AdminRenounced))
+    );
+
+    // pause() returns AdminRenounced
+    assert_eq!(s.client.try_pause(), Err(Ok(Error::AdminRenounced)));
 }
 
 #[test]
@@ -1872,8 +1911,11 @@ fn renounce_admin_without_admin_fails() {
     let s = setup();
     s.client.renounce_admin();
 
-    // A second renounce has no admin to authorize it and must fail.
-    assert!(s.client.try_renounce_admin().is_err());
+    // A second renounce fails with AdminRenounced because admin control is permanently renounced.
+    assert_eq!(
+        s.client.try_renounce_admin(),
+        Err(Ok(Error::AdminRenounced))
+    );
 }
 
 /// Rewrites a stored stream in place, for pushing its bookkeeping to the
