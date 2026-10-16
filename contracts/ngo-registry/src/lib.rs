@@ -2,7 +2,7 @@
 #![no_std]
 use soroban_sdk::{
     contract, contracterror, contractevent, contractimpl, contracttype, symbol_short, Address,
-    Bytes, BytesN, Env, String, Vec,
+    Bytes, BytesN, Env, String,
 };
 
 #[contractevent(topics = ["register"], data_format = "single-value")]
@@ -156,30 +156,6 @@ fn require_admin(env: &Env) -> Result<Address, Error> {
         .ok_or(Error::NotInitialized)?;
     admin.require_auth();
     Ok(admin)
-}
-
-fn approve_registered_ngo(env: &Env, ngo_owner: &Address) -> Result<(), Error> {
-    let key = DataKey::Ngo(ngo_owner.clone());
-    let mut ngo: Ngo = env
-        .storage()
-        .persistent()
-        .get(&key)
-        .ok_or(Error::NotRegistered)?;
-    if ngo.verified {
-        return Err(Error::AlreadyVerified);
-    }
-    ngo.verified = true;
-    env.storage().persistent().set(&key, &ngo);
-    extend_instance_ttl(env);
-    extend_ngo_ttl(env, ngo_owner);
-
-    ApprovedEvent {
-        owner: ngo_owner.clone(),
-        data: (),
-    }
-    .publish(env);
-
-    Ok(())
 }
 
 #[contract]
@@ -605,8 +581,11 @@ impl NgoRegistry {
         extend_instance_ttl(&env);
         extend_ngo_ttl(&env, &ngo_owner);
 
-        env.events()
-            .publish((symbol_short!("approved"), ngo_owner), ());
+        ApprovedEvent {
+            owner: ngo_owner,
+            data: (),
+        }
+        .publish(&env);
 
         Ok(())
     }

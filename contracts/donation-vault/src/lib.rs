@@ -20,6 +20,11 @@ pub struct CancelledAdminEvent {
     pub data: (),
 }
 
+#[contractevent(topics = ["renounce"], data_format = "single-value")]
+pub struct RenouncedAdminEvent {
+    pub data: (),
+}
+
 #[contractevent(topics = ["pause"], data_format = "single-value")]
 pub struct PausedEvent {
     pub data: (),
@@ -463,13 +468,19 @@ fn pay_ngo(env: &Env, token_client: &token::Client, ngo: &Address, amount: i128)
 fn settle(env: &Env, stream: &mut Stream, now: u64) -> Result<i128, Error> {
     let elapsed = now.saturating_sub(stream.last_update);
     let accrued = math::accrued(stream.rate, elapsed, stream.balance);
-    let token_client = token::Client::new(env, &stream.token);
 
     if accrued > 0 {
-        pay_ngo(env, &token_client, &stream.ngo, accrued);
+        // Update stream state before the external token transfer
         record_payout(stream, accrued)?;
     }
     stream.last_update = now;
+
+    // External token transfer is the last step
+    if accrued > 0 {
+        let token_client = token::Client::new(env, &stream.token);
+        pay_ngo(env, &token_client, &stream.ngo, accrued);
+    }
+
     Ok(accrued)
 }
 
@@ -545,7 +556,7 @@ impl DonationVault {
             .set(&DataKey::AdminRenounced, &true);
         extend_instance_ttl(&env);
 
-        env.events().publish((symbol_short!("renounce"),), ());
+        RenouncedAdminEvent { data: () }.publish(&env);
 
         Ok(())
     }
@@ -1131,6 +1142,11 @@ impl DonationVault {
     /// ```
     pub fn clear_treasury(env: Env) -> Result<(), Error> {
         require_admin(&env)?;
+        // Reject clearing the treasury when a fee is currently set
+        let fee_bps: u32 = env.storage().instance().get(&DataKey::FeeBps).unwrap_or(0);
+        if fee_bps > 0 {
+            return Err(Error::FeeRequiresTreasury);
+        }
         env.storage().instance().remove(&DataKey::Treasury);
         extend_instance_ttl(&env);
         Ok(())
@@ -1164,6 +1180,13 @@ impl DonationVault {
         require_admin(&env)?;
         if fee_bps > MAX_FEE_BPS {
             return Err(Error::FeeTooHigh);
+        }
+        // Reject setting a non-zero fee when no treasury is configured
+        if fee_bps > 0 {
+            let treasury: Option<Address> = env.storage().instance().get(&DataKey::Treasury);
+            if treasury.is_none() {
+                return Err(Error::FeeRequiresTreasury);
+            }
         }
         env.storage().instance().set(&DataKey::FeeBps, &fee_bps);
         extend_instance_ttl(&env);
@@ -1236,6 +1259,13 @@ impl DonationVault {
         require_admin(&env)?;
         if fee_bps > MAX_FEE_BPS {
             return Err(Error::FeeTooHigh);
+        }
+        // Reject setting a non-zero fee when no treasury is configured
+        if fee_bps > 0 {
+            let treasury: Option<Address> = env.storage().instance().get(&DataKey::Treasury);
+            if treasury.is_none() {
+                return Err(Error::FeeRequiresTreasury);
+            }
         }
         let key = DataKey::TokenFeeBps(token.clone());
         env.storage().persistent().set(&key, &fee_bps);
@@ -1543,10 +1573,6 @@ impl DonationVault {
             .checked_add(deposit)
             .ok_or(Error::ArithmeticOverflow)?;
 
-        let token_client = token::Client::new(&env, &token);
-        token_client.transfer(&donor, env.current_contract_address(), &deposit);
-        env.storage().instance().set(&DataKey::TotalDonated, &next_total);
-
         let stream_id: u64 = env
             .storage()
             .instance()
@@ -1567,6 +1593,7 @@ impl DonationVault {
             cancelled: false,
         };
 
+        // Write all state before the external token transfer
         env.storage()
             .persistent()
             .set(&DataKey::Stream(stream_id), &stream);
@@ -1586,8 +1613,14 @@ impl DonationVault {
             STREAM_BUMP_AMOUNT,
         );
 
+        env.storage().instance().set(&DataKey::TotalDonated, &next_total);
+
         extend_instance_ttl(&env);
         extend_stream_ttl(&env, stream_id);
+
+        // External token transfer is the last step
+        let token_client = token::Client::new(&env, &token);
+        token_client.transfer(&donor, &env.current_contract_address(), &deposit);
 
         CreatedEvent {
             stream_id,
@@ -1838,13 +1871,9 @@ impl DonationVault {
         let now = env.ledger().timestamp();
         let accrued = settle(&env, &mut stream, now)?;
 
-        let token_client = token::Client::new(&env, &stream.token);
-
         let refund = stream.balance;
-        if refund > 0 {
-            token_client.transfer(&env.current_contract_address(), &stream.donor, &refund);
-        }
 
+        // Update state before the external token transfer
         stream.balance = 0;
         stream.rate = 0;
         stream.cancelled = true;
@@ -1858,6 +1887,12 @@ impl DonationVault {
             .get(&DataKey::CancelGraceLedgers)
             .unwrap_or(0);
         extend_cancelled_stream_ttl(&env, stream_id, grace_ledgers)?;
+
+        // External token transfer is the last step
+        let token_client = token::Client::new(&env, &stream.token);
+        if refund > 0 {
+            token_client.transfer(&env.current_contract_address(), &stream.donor, &refund);
+        }
 
         // Only emit the cancel event when something actually moved. When
         // both values are zero the stream was already cancelled — emitting
@@ -2023,7 +2058,7 @@ impl DonationVault {
         let now = env.ledger().timestamp();
         let _accrued = settle(&env, &mut stream, now)?;
 
-        token_client.transfer(&stream.donor, env.current_contract_address(), &amount);
+        // Update state before the external token transfer
         stream.balance = stream
             .balance
             .checked_add(amount)
@@ -2041,6 +2076,9 @@ impl DonationVault {
         env.storage().persistent().set(&key, &stream);
         extend_instance_ttl(&env);
         extend_stream_ttl(&env, stream_id);
+
+        // External token transfer is the last step
+        token_client.transfer(&stream.donor, &env.current_contract_address(), &amount);
 
         ToppedUpEvent { stream_id, amount }.publish(&env);
 
