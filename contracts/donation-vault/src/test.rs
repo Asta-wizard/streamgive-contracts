@@ -2625,3 +2625,159 @@ fn total_donated_overflow_rejects_create_and_top_up() {
         Err(Ok(Error::ArithmeticOverflow))
     );
 }
+
+// =============================================================================
+// rescue_stream tests (issue #286)
+// =============================================================================
+
+#[test]
+fn rescue_stream_refunds_donor_and_updates_state_and_emits_event() {
+    let s = setup();
+    s.token_admin.mint(&s.donor, &1_000);
+
+    let stream_id = s
+        .client
+        .create_stream(&s.donor, &s.ngo, &s.token.address, &1_000, &10);
+
+    // Advance timestamp by 20 seconds: under normal cancel, 200 would accrue to the NGO.
+    s.env.ledger().with_mut(|l| l.timestamp += 20);
+
+    // Initial balances before rescue:
+    assert_eq!(s.token.balance(&s.donor), 0);
+    assert_eq!(s.token.balance(&s.client.address), 1_000);
+    assert_eq!(s.token.balance(&s.ngo), 0);
+
+    s.client.pause();
+
+    // Rescue the stream.
+    let refund = s.client.rescue_stream(&stream_id);
+    assert_eq!(refund, 1_000);
+
+    // Assert exact balances moved: full remaining balance refunded to donor, NGO gets nothing.
+    assert_eq!(s.token.balance(&s.donor), 1_000);
+    assert_eq!(s.token.balance(&s.client.address), 0);
+    assert_eq!(s.token.balance(&s.ngo), 0);
+
+    // Assert stream's resulting state.
+    let stream = s.client.get_stream(&stream_id);
+    assert_eq!(stream.balance, 0);
+    assert_eq!(stream.rate, 0);
+    assert!(stream.cancelled);
+    assert_eq!(stream.status, StreamStatus::Cancelled);
+    assert_eq!(stream.last_update, s.env.ledger().timestamp());
+    assert_eq!(stream.withdrawn, 0);
+
+    // Assert rescue event topics and data.
+    assert_last_event(&s.env, (symbol_short!("rescue"), stream_id), refund);
+    let evt = last_event(&s.env);
+    assert_eq!(
+        evt,
+        (
+            (symbol_short!("rescue"), stream_id).into_val(&s.env),
+            1_000i128.into_val(&s.env),
+        )
+    );
+}
+
+#[test]
+fn rescue_stream_when_not_paused_returns_not_paused() {
+    let s = setup();
+    s.token_admin.mint(&s.donor, &1_000);
+
+    let stream_id = s
+        .client
+        .create_stream(&s.donor, &s.ngo, &s.token.address, &1_000, &10);
+
+    // Vault is not paused; rescue must return Error::NotPaused.
+    let result = s.client.try_rescue_stream(&stream_id);
+    assert_eq!(result, Err(Ok(Error::NotPaused)));
+}
+
+#[test]
+fn rescue_stream_already_cancelled_returns_stream_cancelled() {
+    let s = setup();
+    s.token_admin.mint(&s.donor, &1_000);
+
+    let stream_id = s
+        .client
+        .create_stream(&s.donor, &s.ngo, &s.token.address, &1_000, &10);
+
+    // Donor cancels the stream first.
+    s.client.cancel_stream(&stream_id);
+
+    // Pause vault and try to rescue the cancelled stream.
+    s.client.pause();
+    let result = s.client.try_rescue_stream(&stream_id);
+    assert_eq!(result, Err(Ok(Error::StreamCancelled)));
+}
+
+#[test]
+fn rescue_stream_twice_returns_stream_cancelled() {
+    let s = setup();
+    s.token_admin.mint(&s.donor, &1_000);
+
+    let stream_id = s
+        .client
+        .create_stream(&s.donor, &s.ngo, &s.token.address, &1_000, &10);
+
+    s.client.pause();
+    let refund = s.client.rescue_stream(&stream_id);
+    assert_eq!(refund, 1_000);
+
+    // Second rescue attempt on the already rescued stream fails with StreamCancelled.
+    let result = s.client.try_rescue_stream(&stream_id);
+    assert_eq!(result, Err(Ok(Error::StreamCancelled)));
+}
+
+#[test]
+fn rescue_stream_unknown_id_returns_stream_not_found() {
+    let s = setup();
+    s.client.pause();
+
+    let unknown_id = 123456u64;
+    let result = s.client.try_rescue_stream(&unknown_id);
+    assert_eq!(result, Err(Ok(Error::StreamNotFound)));
+}
+
+#[test]
+#[should_panic]
+fn rescue_stream_fails_for_non_admin_caller() {
+    let s = setup();
+    s.token_admin.mint(&s.donor, &1_000);
+
+    let stream_id = s
+        .client
+        .create_stream(&s.donor, &s.ngo, &s.token.address, &1_000, &10);
+
+    s.client.pause();
+
+    let non_admin = Address::generate(&s.env);
+    s.env.mock_auths(&[MockAuth {
+        address: &non_admin,
+        invoke: &MockAuthInvoke {
+            contract: &s.client.address,
+            fn_name: "rescue_stream",
+            args: (stream_id,).into_val(&s.env),
+            sub_invokes: &[],
+        },
+    }]);
+
+    s.client.rescue_stream(&stream_id);
+}
+
+#[test]
+#[should_panic]
+fn rescue_stream_fails_without_admin_auth() {
+    let s = setup();
+    s.token_admin.mint(&s.donor, &1_000);
+
+    let stream_id = s
+        .client
+        .create_stream(&s.donor, &s.ngo, &s.token.address, &1_000, &10);
+
+    s.client.pause();
+
+    s.env.mock_auths(&[]);
+    s.client.rescue_stream(&stream_id);
+}
+
