@@ -94,11 +94,9 @@ fn setup() -> Setup<'static> {
     let env = Env::default();
     env.mock_all_auths();
 
-    let contract_id = env.register(DonationVault, ());
-    let client = DonationVaultClient::new(&env, &contract_id);
-
     let admin = Address::generate(&env);
-    client.init(&admin);
+    let contract_id = env.register(DonationVault, DonationVaultArgs::__constructor(&admin));
+    let client = DonationVaultClient::new(&env, &contract_id);
 
     let token_admin_addr = Address::generate(&env);
     let (token, token_admin) = create_token(&env, &token_admin_addr);
@@ -2123,8 +2121,14 @@ fn pending_payout_with_no_treasury_returns_full_gross_and_zero_fee() {
 fn admin_functions_before_init_return_not_initialized() {
     let env = Env::default();
     env.mock_all_auths();
-    let contract_id = env.register(DonationVault, ());
+    let admin = Address::generate(&env);
+    let contract_id = env.register(DonationVault, DonationVaultArgs::__constructor(&admin));
     let client = DonationVaultClient::new(&env, &contract_id);
+
+    // Simulate uninitialized state where DataKey::Admin is missing
+    env.as_contract(&contract_id, || {
+        env.storage().instance().remove(&DataKey::Admin);
+    });
 
     let treasury = Address::generate(&env);
     let new_admin = Address::generate(&env);
@@ -2509,6 +2513,15 @@ fn double_init_fails_and_preserves_original_admin() {
         Err(Ok(Error::AlreadyInitialized))
     );
     assert_eq!(s.client.admin(), admin);
+}
+
+#[test]
+#[should_panic]
+fn init_without_admin_auth_fails() {
+    let s = setup();
+    let attacker = Address::generate(&s.env);
+    s.env.mock_auths(&[]);
+    s.client.init(&attacker);
 }
 
 #[test]

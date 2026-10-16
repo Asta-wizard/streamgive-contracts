@@ -163,23 +163,29 @@ pub struct NgoRegistry;
 
 #[contractimpl]
 impl NgoRegistry {
-    /// Sets the registry admin. Can only be called once.
+    /// Initializes the registry with an administrator atomically at deployment time.
+    pub fn __constructor(env: Env, admin: Address) {
+        env.storage().instance().set(&DataKey::Admin, &admin);
+        extend_instance_ttl(&env);
+    }
+
+    /// Sets the registry admin. Can only be called once. Neutralized in favor of
+    /// `__constructor` for atomic deployment; requires admin auth.
     ///
     /// # Examples
     ///
     /// ```rust,no_run
     /// # use soroban_sdk::{testutils::Address as _, Address, Env};
-    /// # use ngo_registry::{NgoRegistry, NgoRegistryClient};
+    /// # use ngo_registry::{NgoRegistry, NgoRegistryArgs, NgoRegistryClient};
     /// let env = Env::default();
     /// env.mock_all_auths();
     ///
-    /// let contract_id = env.register(NgoRegistry, ());
-    /// let client = NgoRegistryClient::new(&env, &contract_id);
-    ///
     /// let admin = Address::generate(&env);
-    /// client.init(&admin);
+    /// let contract_id = env.register(NgoRegistry, NgoRegistryArgs::__constructor(&admin));
+    /// let client = NgoRegistryClient::new(&env, &contract_id);
     /// ```
     pub fn init(env: Env, admin: Address) -> Result<(), Error> {
+        admin.require_auth();
         if env.storage().instance().has(&DataKey::Admin) {
             return Err(Error::AlreadyInitialized);
         }

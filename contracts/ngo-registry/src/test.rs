@@ -15,11 +15,9 @@ fn setup() -> (Env, NgoRegistryClient<'static>, Address) {
     env.ledger()
         .with_mut(|l| l.max_entry_ttl = 365 * DAY_IN_LEDGERS);
 
-    let contract_id = env.register(NgoRegistry, ());
-    let client = NgoRegistryClient::new(&env, &contract_id);
-
     let admin = Address::generate(&env);
-    client.init(&admin);
+    let contract_id = env.register(NgoRegistry, NgoRegistryArgs::__constructor(&admin));
+    let client = NgoRegistryClient::new(&env, &contract_id);
 
     (env, client, admin)
 }
@@ -35,6 +33,19 @@ fn double_init_fails() {
     let (_env, client, admin) = setup();
     let result = client.try_init(&admin);
     assert_eq!(result, Err(Ok(Error::AlreadyInitialized)));
+}
+
+#[test]
+#[should_panic]
+fn init_without_admin_auth_fails() {
+    let env = Env::default();
+    let admin = Address::generate(&env);
+    let contract_id = env.register(NgoRegistry, NgoRegistryArgs::__constructor(&admin));
+    let client = NgoRegistryClient::new(&env, &contract_id);
+
+    let attacker = Address::generate(&env);
+    env.mock_auths(&[]);
+    client.init(&attacker);
 }
 
 #[test]
