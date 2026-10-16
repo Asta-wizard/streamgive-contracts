@@ -200,6 +200,8 @@ pub enum DataKey {
     Treasury,
     /// The protocol fee in basis points.
     FeeBps,
+    /// An optional protocol fee override in basis points for a token.
+    TokenFeeBps(Address),
     /// Lifetime sum of successful stream deposits and top-ups.
     TotalDonated,
     /// The token allowlist surfaced to frontend token pickers. See
@@ -1758,7 +1760,7 @@ impl DonationVault {
             record_payout(&mut stream, accrued)?;
             stream.last_update = now;
             env.storage().persistent().set(&key, &stream);
-            extend_stream_ttl(&env, stream_id, stream.rate, stream.balance);
+            extend_stream_ttl(&env, stream_id);
 
             let total = payouts.get(stream.token.clone()).unwrap_or(0);
             payouts.set(
@@ -2142,4 +2144,5 @@ impl DonationVault {
     }
 }
 
+#[cfg(test)]
 mod test;

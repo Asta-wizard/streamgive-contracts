@@ -70,6 +70,8 @@ pub struct Ngo {
 pub enum DataKey {
     /// The address authorized to initialize and administer the registry.
     Admin,
+    /// The administrator nominated to take over, pending acceptance.
+    PendingAdmin,
     /// Running total of registered NGOs (a `u32`, seeded from `NgoCount`).
     TotalNgos,
     /// The registry record keyed by an NGO owner's address.

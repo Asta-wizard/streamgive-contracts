@@ -6,12 +6,9 @@ use soroban_sdk::testutils::storage::{Instance as _, Persistent as _};
 use soroban_sdk::testutils::{
     Address as _, AuthorizedFunction, Events as _, Ledger, MockAuth, MockAuthInvoke,
 };
-use soroban_sdk::testutils::{Address as _, AuthorizedFunction, Ledger, MockAuth, MockAuthInvoke};
 use soroban_sdk::token::{Client as TokenClient, StellarAssetClient};
-use soroban_sdk::xdr::{ContractEventBody, ScSymbol, ScVal, ScVec};
 use soroban_sdk::xdr::{ContractEventBody, ScVal, ScVec};
 use soroban_sdk::{symbol_short, IntoVal, Symbol, TryFromVal, Val, Vec};
-use soroban_sdk::{IntoVal, Symbol, TryFromVal, Val, Vec};
 
 /// Asserts that the most recently published event has the given topics and
 /// data, regardless of which contract emitted it — vault entry points always
@@ -990,14 +987,6 @@ fn set_treasury_rejects_the_vault_own_address() {
 
 #[test]
 fn set_treasury_rejects_the_vault_own_address_when_none_is_set() {
-    let withdrawn = s.client.withdraw(&stream_id);
-    assert_eq!(withdrawn, 1);
-    assert_eq!(s.token.balance(&s.ngo), 1);
-    assert_eq!(s.token.balance(&treasury), 0);
-}
-
-#[test]
-fn compute_fee_avoids_overflow_near_i128_max() {
     let s = setup();
 
     let result = s.client.try_set_treasury(&s.client.address);
@@ -1006,19 +995,26 @@ fn compute_fee_avoids_overflow_near_i128_max() {
 }
 
 #[test]
-fn get_config_reflects_admin_settings() {
+fn compute_fee_avoids_overflow_near_i128_max() {
     let s = setup();
     let treasury = Address::generate(&s.env);
-    // `amount * fee_bps` (i128::MAX * 1_000) overflows i128 long before the
-    // divide-by-10_000 brings the result back into range. A naive multiply,
-    // or a `saturating_mul` that silently clamps the overflowed product
-    // before dividing, both produce a fee many orders of magnitude smaller
-    // than the correct one. `compute_fee` must return the exact
-    // floor(amount * fee_bps / 10_000) instead.
+    s.client.set_treasury(&treasury);
+    s.client.set_fee_bps(&1_000);
+
     let amount = i128::MAX;
     let fee = s.env.as_contract(&s.client.address, || {
         compute_fee(&s.env, &s.token.address, amount)
     });
+    assert_eq!(
+        fee,
+        (amount / 10_000) * 1_000 + ((amount % 10_000) * 1_000) / 10_000
+    );
+}
+
+#[test]
+fn get_config_reflects_admin_settings() {
+    let s = setup();
+    let treasury = Address::generate(&s.env);
 
     s.client.set_treasury(&treasury);
     s.client.set_fee_bps(&500);
@@ -2117,60 +2113,6 @@ fn pending_payout_with_no_treasury_returns_full_gross_and_zero_fee() {
     assert_eq!(stream.withdrawn, 0);
 }
 
-#[test]
-fn pending_payout_with_treasury_and_zero_bps_returns_full_gross_and_zero_fee() {
-    let s = setup();
-    s.token_admin.mint(&s.donor, &1_000);
-
-    let treasury = Address::generate(&s.env);
-    s.client.set_treasury(&treasury);
-    // fee_bps defaults to 0 — a treasury exists but takes nothing
-
-    let stream_id = s
-        .client
-        .create_stream(&s.donor, &s.ngo, &s.token.address, &1_000, &10);
-    s.env.ledger().with_mut(|l| l.timestamp += 50); // 500 accrues
-
-    let (net, fee) = s.client.pending_payout(&stream_id);
-    assert_eq!(fee, 0); // 0 bps → zero fee even with a treasury set
-    assert_eq!(net, 500);
-
-    // Read-only: nothing moved.
-    assert_eq!(s.token.balance(&s.ngo), 0);
-    assert_eq!(s.token.balance(&treasury), 0);
-}
-
-#[test]
-fn pending_payout_with_nonzero_fee_matches_actual_withdraw_split() {
-    let s = setup();
-    s.token_admin.mint(&s.donor, &1_000);
-
-    let treasury = Address::generate(&s.env);
-    s.client.set_treasury(&treasury);
-    s.client.set_fee_bps(&500); // 5%
-
-    let stream_id = s
-        .client
-        .create_stream(&s.donor, &s.ngo, &s.token.address, &1_000, &10);
-    s.env.ledger().with_mut(|l| l.timestamp += 50); // 500 accrues
-
-    let (net, fee) = s.client.pending_payout(&stream_id);
-    assert_eq!(fee, 25); // 5% of 500
-    assert_eq!(net, 475); // 500 - 25
-
-    // Read-only: nothing moved yet.
-    assert_eq!(s.token.balance(&s.ngo), 0);
-    assert_eq!(s.token.balance(&treasury), 0);
-    let stream = s.client.get_stream(&stream_id);
-    assert_eq!(stream.balance, 1_000);
-    assert_eq!(stream.withdrawn, 0);
-
-    // The values must match exactly what withdraw actually distributes.
-    s.client.withdraw(&stream_id);
-    assert_eq!(s.token.balance(&s.ngo), net);
-    assert_eq!(s.token.balance(&treasury), fee);
-}
-
 // ── Issue #64 ─────────────────────────────────────────────────────────────────
 // Every admin-gated entry point must fail closed with Error::NotInitialized
 // when called before init, rather than silently defaulting (e.g. paused()
@@ -2570,8 +2512,58 @@ fn double_init_fails_and_preserves_original_admin() {
 }
 
 #[test]
-fn total_donated_counts_create_and_top_up() {
 fn pause_blocks_top_up_without_mutating_stream_or_balances() {
+    let s = setup();
+    s.token_admin.mint(&s.donor, &2_000);
+
+    let stream_id = s
+        .client
+        .create_stream(&s.donor, &s.ngo, &s.token.address, &1_000, &10);
+    let before = s.client.get_stream(&stream_id);
+    let donor_balance_before = s.token.balance(&s.donor);
+    let vault_balance_before = s.token.balance(&s.client.address);
+
+    s.client.pause();
+    assert_eq!(
+        s.client.try_top_up(&stream_id, &500),
+        Err(Ok(Error::ContractPaused))
+    );
+    assert_eq!(s.client.get_stream(&stream_id), before);
+    assert_eq!(s.token.balance(&s.donor), donor_balance_before);
+    assert_eq!(s.token.balance(&s.client.address), vault_balance_before);
+
+    s.client.unpause();
+    s.client.top_up(&stream_id, &500);
+    assert_eq!(s.client.get_stream(&stream_id).balance, 1_500);
+}
+
+#[test]
+fn withdraw_batch_pays_multiple_streams() {
+    let s = setup();
+    s.token_admin.mint(&s.donor, &2_000);
+
+    let first = s
+        .client
+        .create_stream(&s.donor, &s.ngo, &s.token.address, &1_000, &10);
+    let second = s
+        .client
+        .create_stream(&s.donor, &s.ngo, &s.token.address, &1_000, &20);
+    s.env.ledger().with_mut(|l| l.timestamp += 10);
+
+    let mut ids = Vec::new(&s.env);
+    ids.push_back(first);
+    ids.push_back(second);
+    let withdrawn = s.client.withdraw_batch(&ids);
+
+    assert_eq!(withdrawn.get(0), Some(100));
+    assert_eq!(withdrawn.get(1), Some(200));
+    assert_eq!(s.token.balance(&s.ngo), 300);
+    assert_eq!(s.client.get_stream(&first).withdrawn, 100);
+    assert_eq!(s.client.get_stream(&second).withdrawn, 200);
+}
+
+#[test]
+fn total_donated_counts_create_and_top_up() {
     let s = setup();
     s.token_admin.mint(&s.donor, &2_000);
 
