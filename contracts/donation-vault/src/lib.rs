@@ -1142,6 +1142,11 @@ impl DonationVault {
     /// ```
     pub fn clear_treasury(env: Env) -> Result<(), Error> {
         require_admin(&env)?;
+        // Reject clearing the treasury when a fee is currently set
+        let fee_bps: u32 = env.storage().instance().get(&DataKey::FeeBps).unwrap_or(0);
+        if fee_bps > 0 {
+            return Err(Error::FeeRequiresTreasury);
+        }
         env.storage().instance().remove(&DataKey::Treasury);
         extend_instance_ttl(&env);
         Ok(())
@@ -1175,6 +1180,13 @@ impl DonationVault {
         require_admin(&env)?;
         if fee_bps > MAX_FEE_BPS {
             return Err(Error::FeeTooHigh);
+        }
+        // Reject setting a non-zero fee when no treasury is configured
+        if fee_bps > 0 {
+            let treasury: Option<Address> = env.storage().instance().get(&DataKey::Treasury);
+            if treasury.is_none() {
+                return Err(Error::FeeRequiresTreasury);
+            }
         }
         env.storage().instance().set(&DataKey::FeeBps, &fee_bps);
         extend_instance_ttl(&env);
@@ -1247,6 +1259,13 @@ impl DonationVault {
         require_admin(&env)?;
         if fee_bps > MAX_FEE_BPS {
             return Err(Error::FeeTooHigh);
+        }
+        // Reject setting a non-zero fee when no treasury is configured
+        if fee_bps > 0 {
+            let treasury: Option<Address> = env.storage().instance().get(&DataKey::Treasury);
+            if treasury.is_none() {
+                return Err(Error::FeeRequiresTreasury);
+            }
         }
         let key = DataKey::TokenFeeBps(token.clone());
         env.storage().persistent().set(&key, &fee_bps);
