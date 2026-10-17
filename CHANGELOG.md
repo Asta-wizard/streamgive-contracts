@@ -20,6 +20,9 @@ This project does not yet follow a formal versioning scheme — each contract's
   treasury payout (`set_treasury` / `treasury`).
 - `donation-vault`: `clear_token_fee_bps` to remove a per-token fee override,
   restoring the global fee. Emits `tokfeeclr`.
+- `donation-vault`, `ngo-registry`: unit test coverage for `upgrade` entry
+  points across both contracts, verifying admin authorization requirements,
+  non-admin rejection, and state preservation.
 - `donation-vault`: emit `treasset` event on `set_treasury` so off-chain
   indexers can track protocol fee destination changes.
 - `donation-vault`: admin-configurable `cancel_grace_ledgers` retention for

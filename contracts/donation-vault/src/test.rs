@@ -2894,3 +2894,73 @@ fn total_donated_overflow_rejects_create_and_top_up() {
         Err(Ok(Error::ArithmeticOverflow))
     );
 }
+
+// =============================================================================
+// upgrade (contract bytecode upgrade)
+// =============================================================================
+
+#[test]
+fn upgrade_requires_admin_auth() {
+    let s = setup();
+    let admin = s.client.admin();
+    let fake_hash = BytesN::from_array(&s.env, &[1u8; 32]);
+
+    s.client.upgrade(&fake_hash);
+    assert_auth_required_from(&s, &admin, "upgrade");
+}
+
+#[test]
+fn upgrade_rejects_non_admin() {
+    let s = setup();
+    let fake_hash = BytesN::from_array(&s.env, &[1u8; 32]);
+
+    s.env.mock_auths(&[]);
+    let result = s.client.try_upgrade(&fake_hash);
+    assert!(result.is_err());
+}
+
+#[test]
+fn upgrade_fails_when_admin_renounced() {
+    let s = setup();
+    let fake_hash = BytesN::from_array(&s.env, &[1u8; 32]);
+
+    s.client.renounce_admin();
+    let result = s.client.try_upgrade(&fake_hash);
+    assert_eq!(result, Err(Ok(Error::AdminRenounced)));
+}
+
+#[test]
+fn upgrade_fails_with_unuploaded_wasm_hash() {
+    let s = setup();
+    let unuploaded_hash = BytesN::from_array(&s.env, &[42u8; 32]);
+    let result = s.client.try_upgrade(&unuploaded_hash);
+    assert!(result.is_err());
+}
+
+#[test]
+fn upgrade_preserves_state() {
+    let s = setup();
+    s.token_admin.mint(&s.donor, &2_000);
+
+    let treasury = Address::generate(&s.env);
+    s.client.set_treasury(&treasury);
+    s.client.set_fee_bps(&500);
+    s.client.set_min_deposit(&100);
+
+    let stream_id = s
+        .client
+        .create_stream(&s.donor, &s.ngo, &s.token.address, &1_000, &10);
+
+    let config_before = s.client.get_config();
+    let stream_before = s.client.get_stream(&stream_id);
+
+    // Negative case: attempting an upgrade with an unuploaded wasm hash fails
+    let unuploaded_hash = BytesN::from_array(&s.env, &[99u8; 32]);
+    assert!(s.client.try_upgrade(&unuploaded_hash).is_err());
+
+    // State reads back identically after
+    let config_after = s.client.get_config();
+    let stream_after = s.client.get_stream(&stream_id);
+    assert_eq!(config_before, config_after);
+    assert_eq!(stream_before, stream_after);
+}
