@@ -621,6 +621,70 @@ fn revoke_ngo_publishes_event() {
 }
 
 // =============================================================================
+// upgrade (contract bytecode upgrade)
+// =============================================================================
+
+#[test]
+fn upgrade_requires_admin_auth() {
+    let (env, client, admin) = setup();
+    let fake_hash = BytesN::from_array(&env, &[1u8; 32]);
+
+    client.upgrade(&fake_hash);
+    let auths = env.auths();
+    assert_eq!(auths.len(), 1, "expected exactly one authorizer");
+    assert_eq!(auths[0].0, admin);
+    match &auths[0].1.function {
+        AuthorizedFunction::Contract((contract, function, _)) => {
+            assert_eq!(contract, &client.address);
+            assert_eq!(function, &Symbol::new(&env, "upgrade"));
+        }
+        _ => panic!("expected a contract invocation"),
+    }
+}
+
+#[test]
+fn upgrade_rejects_non_admin() {
+    let (env, client, _admin) = setup();
+    let fake_hash = BytesN::from_array(&env, &[1u8; 32]);
+
+    env.mock_auths(&[]);
+    let result = client.try_upgrade(&fake_hash);
+    assert!(result.is_err());
+}
+
+#[test]
+fn upgrade_fails_with_unuploaded_wasm_hash() {
+    let (env, client, _admin) = setup();
+    let unuploaded_hash = BytesN::from_array(&env, &[42u8; 32]);
+    let result = client.try_upgrade(&unuploaded_hash);
+    assert!(result.is_err());
+}
+
+#[test]
+fn upgrade_preserves_state() {
+    let (env, client, _admin) = setup();
+    let owner = Address::generate(&env);
+    let name = String::from_str(&env, "Doctors Without Borders");
+
+    client.register(&owner, &name);
+    client.approve_ngo(&owner);
+
+    let ngo_before = client.get_ngo(&owner);
+    assert!(ngo_before.verified);
+    assert_eq!(ngo_before.name, name);
+    assert_eq!(client.ngo_count(), 1);
+
+    // Negative case: attempting an upgrade with an unuploaded wasm hash fails
+    let unuploaded_hash = BytesN::from_array(&env, &[99u8; 32]);
+    assert!(client.try_upgrade(&unuploaded_hash).is_err());
+
+    // State reads back identically after
+    let ngo_after = client.get_ngo(&owner);
+    assert_eq!(ngo_before.owner, ngo_after.owner);
+    assert_eq!(ngo_before.name, ngo_after.name);
+    assert_eq!(ngo_before.verified, ngo_after.verified);
+    assert_eq!(client.ngo_count(), 1);
+}
 // list_ngos pagination tests (issue #283)
 // =============================================================================
 

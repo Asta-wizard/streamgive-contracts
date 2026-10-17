@@ -153,7 +153,7 @@ fn full_lifecycle_create_accrue_withdraw_cancel() {
         withdrew,
         (
             (symbol_short!("withdraw"), stream_id).into_val(&s.env),
-            500i128.into_val(&s.env),
+            (500i128, 0i128, 500i128).into_val(&s.env),
         )
     );
     assert_eq!(s.token.balance(&s.ngo), 500);
@@ -270,7 +270,7 @@ fn top_up_and_modify_rate_settle_before_changing() {
         topped_up,
         (
             (symbol_short!("topup"), stream_id).into_val(&s.env),
-            500i128.into_val(&s.env),
+            (500i128, 100i128).into_val(&s.env),
         )
     );
     assert_eq!(s.token.balance(&s.ngo), 100);
@@ -284,7 +284,7 @@ fn top_up_and_modify_rate_settle_before_changing() {
     assert_last_event(
         &s.env,
         (symbol_short!("ratemod"), stream_id),
-        (10i128, 20i128),
+        (10i128, 20i128, 50i128),
     );
     let rate_changed = last_event(&s.env);
 
@@ -292,7 +292,7 @@ fn top_up_and_modify_rate_settle_before_changing() {
         rate_changed,
         (
             (symbol_short!("ratemod"), stream_id).into_val(&s.env),
-            (10i128, 20i128).into_val(&s.env),
+            (10i128, 20i128, 50i128).into_val(&s.env),
         )
     );
     assert_eq!(s.token.balance(&s.ngo), 150);
@@ -1012,20 +1012,85 @@ fn compute_fee_avoids_overflow_near_i128_max() {
 #[test]
 fn get_config_reflects_admin_settings() {
     let s = setup();
-    let treasury = Address::generate(&s.env);
+    s.token_admin.mint(&s.donor, &5_000);
 
+    // 1. Initial default configuration
+    assert_eq!(
+        s.client.get_config(),
+        Config {
+            paused: false,
+            treasury: None,
+            fee_bps: 0,
+            min_deposit: 0,
+            max_streams_per_donor: 100,
+            registry: None,
+            cancel_grace_ledgers: 0,
+            total_donated: 0,
+            pending_admin: None,
+            renounced: false,
+        }
+    );
+
+    // 2. Set admin parameters
+    let treasury = Address::generate(&s.env);
+    let registry = Address::generate(&s.env);
     s.client.set_treasury(&treasury);
     s.client.set_fee_bps(&500);
+    s.client.set_min_deposit(&100);
+    s.client.set_max_streams_per_donor(&50);
+    s.client.set_registry(&registry);
+    s.client.set_cancel_grace_ledgers(&10);
     s.client.pause();
 
     assert_eq!(
         s.client.get_config(),
         Config {
             paused: true,
-            treasury: Some(treasury),
+            treasury: Some(treasury.clone()),
             fee_bps: 500,
+            min_deposit: 100,
+            max_streams_per_donor: 50,
+            registry: Some(registry.clone()),
+            cancel_grace_ledgers: 10,
+            total_donated: 0,
+            pending_admin: None,
+            renounced: false,
         }
     );
+
+    // 3. Proposed admin state change
+    let candidate = Address::generate(&s.env);
+    s.client.propose_admin(&candidate);
+    assert_eq!(s.client.get_config().pending_admin, Some(candidate));
+
+    // 4. Changed fee
+    s.client.set_fee_bps(&250);
+    assert_eq!(s.client.get_config().fee_bps, 250);
+
+    // 5. Unpause, make donations (create_stream and top_up) -> updates total_donated
+    s.client.unpause();
+    assert!(!s.client.get_config().paused);
+
+    let stream_id = s
+        .client
+        .create_stream(&s.donor, &s.ngo, &s.token.address, &1_000, &10);
+    assert_eq!(s.client.get_config().total_donated, 1_000);
+
+    s.client.top_up(&stream_id, &500);
+    assert_eq!(s.client.get_config().total_donated, 1_500);
+
+    // 6. Renounce admin -> renounced = true, pending_admin = None
+    s.client.renounce_admin();
+    let final_config = s.client.get_config();
+    assert!(final_config.renounced);
+    assert_eq!(final_config.pending_admin, None);
+    assert_eq!(final_config.total_donated, 1_500);
+    assert_eq!(final_config.treasury, Some(treasury));
+    assert_eq!(final_config.fee_bps, 250);
+    assert_eq!(final_config.min_deposit, 100);
+    assert_eq!(final_config.max_streams_per_donor, 50);
+    assert_eq!(final_config.registry, Some(registry));
+    assert_eq!(final_config.cancel_grace_ledgers, 10);
 }
 
 #[test]
@@ -1147,6 +1212,121 @@ fn set_token_fee_bps_emits_token_and_value() {
 }
 
 #[test]
+fn clear_token_fee_bps_requires_admin_auth() {
+    let s = setup();
+    let admin = s.client.admin();
+    s.client.clear_token_fee_bps(&s.token.address);
+    assert_auth_required_from(&s, &admin, "clear_token_fee_bps");
+
+    s.env.mock_auths(&[]);
+    let result = s.client.try_clear_token_fee_bps(&s.token.address);
+    assert!(result.is_err());
+}
+
+#[test]
+fn clear_token_fee_bps_restores_global_fee_on_withdraw() {
+    let s = setup();
+    s.token_admin.mint(&s.donor, &2_000);
+
+    let treasury = Address::generate(&s.env);
+    s.client.set_treasury(&treasury);
+    s.client.set_fee_bps(&500); // 5% global fee
+    s.client.set_token_fee_bps(&s.token.address, &100); // 1% token override
+
+    assert_eq!(s.client.token_fee_bps(&s.token.address), 100);
+
+    // Create stream and withdraw with override in effect
+    let stream_id = s
+        .client
+        .create_stream(&s.donor, &s.ngo, &s.token.address, &1_000, &10);
+    s.env.ledger().with_mut(|l| l.timestamp += 50); // 500 gross accrues
+    // 1% of 500 = 5 fee, 495 net
+    let net = s.client.withdraw(&stream_id);
+    assert_eq!(net, 495);
+    assert_eq!(s.token.balance(&s.ngo), 495);
+    assert_eq!(s.token.balance(&treasury), 5);
+
+    // Clear the token fee override
+    s.client.clear_token_fee_bps(&s.token.address);
+    // Getter reflects fallback to global 5%
+    assert_eq!(s.client.token_fee_bps(&s.token.address), 500);
+
+    // Withdraw again after clearing: global fee (5%) must apply to actual payout
+    s.env.ledger().with_mut(|l| l.timestamp += 50); // another 500 gross accrues
+    // 5% of 500 = 25 fee, 475 net
+    let net2 = s.client.withdraw(&stream_id);
+    assert_eq!(net2, 475);
+    assert_eq!(s.token.balance(&s.ngo), 495 + 475);
+    assert_eq!(s.token.balance(&treasury), 5 + 25);
+}
+
+#[test]
+fn clear_token_fee_bps_with_explicit_zero_override() {
+    let s = setup();
+    s.token_admin.mint(&s.donor, &2_000);
+
+    let treasury = Address::generate(&s.env);
+    s.client.set_treasury(&treasury);
+    s.client.set_fee_bps(&500); // 5% global fee
+    s.client.set_token_fee_bps(&s.token.address, &0); // 0% explicit override
+
+    assert_eq!(s.client.token_fee_bps(&s.token.address), 0);
+
+    let stream_id = s
+        .client
+        .create_stream(&s.donor, &s.ngo, &s.token.address, &1_000, &10);
+    s.env.ledger().with_mut(|l| l.timestamp += 50); // 500 gross accrues
+
+    // Explicit 0% override still gets 0% fee until cleared
+    let net = s.client.withdraw(&stream_id);
+    assert_eq!(net, 500);
+    assert_eq!(s.token.balance(&s.ngo), 500);
+    assert_eq!(s.token.balance(&treasury), 0);
+
+    // Now clear the override
+    s.client.clear_token_fee_bps(&s.token.address);
+    assert_eq!(s.client.token_fee_bps(&s.token.address), 500);
+
+    s.env.ledger().with_mut(|l| l.timestamp += 50); // 500 gross accrues
+    // Global 5% fee applies: 25 fee, 475 net
+    let net2 = s.client.withdraw(&stream_id);
+    assert_eq!(net2, 475);
+    assert_eq!(s.token.balance(&s.ngo), 500 + 475);
+    assert_eq!(s.token.balance(&treasury), 25);
+}
+
+#[test]
+fn clear_token_fee_bps_emits_event() {
+    let s = setup();
+    s.client.set_token_fee_bps(&s.token.address, &200);
+
+    s.client.clear_token_fee_bps(&s.token.address);
+
+    assert_eq!(
+        last_event(&s.env),
+        (
+            (symbol_short!("tokfeeclr"), s.token.address.clone()).into_val(&s.env),
+            ().into_val(&s.env),
+        )
+    );
+}
+
+#[test]
+fn clear_token_fee_bps_noop_when_no_override() {
+    let s = setup();
+    // No override configured for s.token.address
+    let result = s.client.try_clear_token_fee_bps(&s.token.address);
+    assert!(result.is_ok());
+
+    let treasury = Address::generate(&s.env);
+    s.client.set_treasury(&treasury);
+    let events_before = s.env.events().all().len();
+    s.client.clear_token_fee_bps(&s.token.address);
+    let events_after = s.env.events().all().len();
+    assert_eq!(events_before, events_after);
+}
+
+#[test]
 fn withdraw_uses_the_per_token_fee_override_instead_of_the_global_default() {
     let s = setup();
     s.token_admin.mint(&s.donor, &1_000);
@@ -1220,6 +1400,105 @@ fn pending_payout_with_nonzero_fee_matches_actual_withdraw_split() {
     s.client.withdraw(&stream_id);
     assert_eq!(s.token.balance(&s.ngo), net);
     assert_eq!(s.token.balance(&treasury), fee);
+}
+
+#[test]
+fn withdraw_event_amounts_with_non_zero_fee() {
+    let s = setup();
+    s.token_admin.mint(&s.donor, &2_000);
+
+    let treasury = Address::generate(&s.env);
+    s.client.set_treasury(&treasury);
+    s.client.set_fee_bps(&500); // 5% global fee
+
+    let stream_id = s
+        .client
+        .create_stream(&s.donor, &s.ngo, &s.token.address, &1_000, &10);
+    s.env.ledger().with_mut(|l| l.timestamp += 50); // 500 gross accrues
+
+    let net = s.client.withdraw(&stream_id);
+    let withdrew = last_event(&s.env);
+
+    let gross: i128 = 500;
+    let fee: i128 = 25; // 500 * 500 / 10_000
+    assert_eq!(net, 475);
+    // net + fee == gross
+    assert_eq!(net + fee, gross);
+
+    assert_eq!(
+        withdrew,
+        (
+            (symbol_short!("withdraw"), stream_id).into_val(&s.env),
+            (gross, fee, net).into_val(&s.env),
+        )
+    );
+    assert_eq!(s.token.balance(&s.ngo), net);
+    assert_eq!(s.token.balance(&treasury), fee);
+}
+
+#[test]
+fn withdraw_event_amounts_with_token_fee_override() {
+    let s = setup();
+    s.token_admin.mint(&s.donor, &2_000);
+
+    let treasury = Address::generate(&s.env);
+    s.client.set_treasury(&treasury);
+    s.client.set_fee_bps(&500); // 5% global fee
+    s.client.set_token_fee_bps(&s.token.address, &200); // 2% token override
+
+    let stream_id = s
+        .client
+        .create_stream(&s.donor, &s.ngo, &s.token.address, &1_000, &10);
+    s.env.ledger().with_mut(|l| l.timestamp += 50); // 500 gross accrues
+
+    let net = s.client.withdraw(&stream_id);
+    let withdrew = last_event(&s.env);
+
+    let gross: i128 = 500;
+    let fee: i128 = 10; // 500 * 200 / 10_000
+    assert_eq!(net, 490);
+    // net + fee == gross
+    assert_eq!(net + fee, gross);
+
+    assert_eq!(
+        withdrew,
+        (
+            (symbol_short!("withdraw"), stream_id).into_val(&s.env),
+            (gross, fee, net).into_val(&s.env),
+        )
+    );
+    assert_eq!(s.token.balance(&s.ngo), net);
+    assert_eq!(s.token.balance(&treasury), fee);
+}
+
+#[test]
+fn withdraw_event_amounts_with_zero_fee() {
+    let s = setup();
+    s.token_admin.mint(&s.donor, &2_000);
+
+    // No treasury configured -> fee is 0
+    let stream_id = s
+        .client
+        .create_stream(&s.donor, &s.ngo, &s.token.address, &1_000, &10);
+    s.env.ledger().with_mut(|l| l.timestamp += 50); // 500 gross accrues
+
+    let net = s.client.withdraw(&stream_id);
+    let withdrew = last_event(&s.env);
+
+    let gross: i128 = 500;
+    let fee: i128 = 0;
+    assert_eq!(net, 500);
+    // net + fee == gross
+    assert_eq!(net + fee, gross);
+
+    assert_eq!(
+        withdrew,
+        (
+            (symbol_short!("withdraw"), stream_id).into_val(&s.env),
+            (gross, fee, net).into_val(&s.env),
+        )
+    );
+    assert_eq!(s.token.balance(&s.ngo), net);
 }
 
 #[test]
@@ -2114,6 +2393,9 @@ fn admin_entry_points_require_admin_auth() {
 
     s.client.cancel_admin_proposal();
     assert_auth_required_from(&s, &admin, "cancel_admin_proposal");
+
+    s.client.clear_token_fee_bps(&s.token.address);
+    assert_auth_required_from(&s, &admin, "clear_token_fee_bps");
 }
 
 #[test]
@@ -2484,7 +2766,7 @@ fn transfer_stream_emits_event_with_old_and_new_ngo() {
         transferred,
         (
             (symbol_short!("transfer"), stream_id).into_val(&s.env),
-            (s.ngo.clone(), new_ngo.clone()).into_val(&s.env),
+            (s.ngo.clone(), new_ngo.clone(), 0i128).into_val(&s.env),
         )
     );
 }
@@ -2669,6 +2951,56 @@ fn total_donated_overflow_rejects_create_and_top_up() {
 }
 
 // =============================================================================
+// upgrade (contract bytecode upgrade)
+// =============================================================================
+
+#[test]
+fn upgrade_requires_admin_auth() {
+    let s = setup();
+    let admin = s.client.admin();
+    let fake_hash = BytesN::from_array(&s.env, &[1u8; 32]);
+
+    s.client.upgrade(&fake_hash);
+    assert_auth_required_from(&s, &admin, "upgrade");
+}
+
+#[test]
+fn upgrade_rejects_non_admin() {
+    let s = setup();
+    let fake_hash = BytesN::from_array(&s.env, &[1u8; 32]);
+
+    s.env.mock_auths(&[]);
+    let result = s.client.try_upgrade(&fake_hash);
+    assert!(result.is_err());
+}
+
+#[test]
+fn upgrade_fails_when_admin_renounced() {
+    let s = setup();
+    let fake_hash = BytesN::from_array(&s.env, &[1u8; 32]);
+
+    s.client.renounce_admin();
+    let result = s.client.try_upgrade(&fake_hash);
+    assert_eq!(result, Err(Ok(Error::AdminRenounced)));
+}
+
+#[test]
+fn upgrade_fails_with_unuploaded_wasm_hash() {
+    let s = setup();
+    let unuploaded_hash = BytesN::from_array(&s.env, &[42u8; 32]);
+    let result = s.client.try_upgrade(&unuploaded_hash);
+    assert!(result.is_err());
+}
+
+#[test]
+fn upgrade_preserves_state() {
+    let s = setup();
+    s.token_admin.mint(&s.donor, &2_000);
+
+    let treasury = Address::generate(&s.env);
+    s.client.set_treasury(&treasury);
+    s.client.set_fee_bps(&500);
+    s.client.set_min_deposit(&100);
 // rescue_stream tests (issue #286)
 // =============================================================================
 
@@ -2791,6 +3123,19 @@ fn rescue_stream_fails_for_non_admin_caller() {
         .client
         .create_stream(&s.donor, &s.ngo, &s.token.address, &1_000, &10);
 
+    let config_before = s.client.get_config();
+    let stream_before = s.client.get_stream(&stream_id);
+
+    // Negative case: attempting an upgrade with an unuploaded wasm hash fails
+    let unuploaded_hash = BytesN::from_array(&s.env, &[99u8; 32]);
+    assert!(s.client.try_upgrade(&unuploaded_hash).is_err());
+
+    // State reads back identically after
+    let config_after = s.client.get_config();
+    let stream_after = s.client.get_stream(&stream_id);
+    assert_eq!(config_before, config_after);
+    assert_eq!(stream_before, stream_after);
+}
     s.client.pause();
 
     let non_admin = Address::generate(&s.env);
