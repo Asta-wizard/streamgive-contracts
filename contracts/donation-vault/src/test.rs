@@ -2396,6 +2396,9 @@ fn admin_entry_points_require_admin_auth() {
 
     s.client.clear_token_fee_bps(&s.token.address);
     assert_auth_required_from(&s, &admin, "clear_token_fee_bps");
+
+    s.client.set_registry(&Address::generate(&s.env));
+    assert_auth_required_from(&s, &admin, "set_registry");
 }
 
 #[test]
@@ -3123,19 +3126,6 @@ fn rescue_stream_fails_for_non_admin_caller() {
         .client
         .create_stream(&s.donor, &s.ngo, &s.token.address, &1_000, &10);
 
-    let config_before = s.client.get_config();
-    let stream_before = s.client.get_stream(&stream_id);
-
-    // Negative case: attempting an upgrade with an unuploaded wasm hash fails
-    let unuploaded_hash = BytesN::from_array(&s.env, &[99u8; 32]);
-    assert!(s.client.try_upgrade(&unuploaded_hash).is_err());
-
-    // State reads back identically after
-    let config_after = s.client.get_config();
-    let stream_after = s.client.get_stream(&stream_id);
-    assert_eq!(config_before, config_after);
-    assert_eq!(stream_before, stream_after);
-}
     s.client.pause();
 
     let non_admin = Address::generate(&s.env);
@@ -3166,5 +3156,155 @@ fn rescue_stream_fails_without_admin_auth() {
 
     s.env.mock_auths(&[]);
     s.client.rescue_stream(&stream_id);
+}
+
+// =============================================================================
+// NGO registry cross-contract verification & set_registry tests (issue #287)
+// =============================================================================
+
+fn setup_with_registry() -> (Setup<'static>, ngo_registry::NgoRegistryClient<'static>) {
+    let s = setup();
+
+    let admin = s.client.admin();
+    let registry_id = s.env.register(
+        ngo_registry::NgoRegistry,
+        ngo_registry::NgoRegistryArgs::__constructor(&admin),
+    );
+    let registry_client = ngo_registry::NgoRegistryClient::new(&s.env, &registry_id);
+
+    s.client.set_registry(&registry_id);
+
+    (s, registry_client)
+}
+
+#[test]
+fn set_registry_and_registry_getter() {
+    let s = setup();
+    assert_eq!(s.client.registry(), None);
+    assert_eq!(s.client.get_config().registry, None);
+
+    let registry_addr = Address::generate(&s.env);
+    s.client.set_registry(&registry_addr);
+
+    assert_eq!(s.client.registry(), Some(registry_addr.clone()));
+    assert_eq!(s.client.get_config().registry, Some(registry_addr));
+}
+
+#[test]
+fn set_registry_requires_admin_auth() {
+    let s = setup();
+    let admin = s.client.admin();
+    let registry_addr = Address::generate(&s.env);
+
+    s.client.set_registry(&registry_addr);
+    assert_auth_required_from(&s, &admin, "set_registry");
+}
+
+#[test]
+#[should_panic]
+fn set_registry_fails_without_admin_auth() {
+    let s = setup();
+    let registry_addr = Address::generate(&s.env);
+
+    s.env.mock_auths(&[]);
+    s.client.set_registry(&registry_addr);
+}
+
+#[test]
+#[should_panic]
+fn set_registry_rejects_non_admin() {
+    let s = setup();
+    let non_admin = Address::generate(&s.env);
+    let registry_addr = Address::generate(&s.env);
+
+    s.env.mock_auths(&[MockAuth {
+        address: &non_admin,
+        invoke: &MockAuthInvoke {
+            contract: &s.client.address,
+            fn_name: "set_registry",
+            args: (registry_addr.clone(),).into_val(&s.env),
+            sub_invokes: &[],
+        },
+    }]);
+
+    s.client.set_registry(&registry_addr);
+}
+
+#[test]
+fn create_stream_succeeds_for_verified_ngo() {
+    let (s, registry) = setup_with_registry();
+    s.token_admin.mint(&s.donor, &1_000);
+
+    registry.register(&s.ngo, &soroban_sdk::String::from_str(&s.env, "Red Cross"));
+    registry.approve_ngo(&s.ngo);
+
+    let stream_id = s
+        .client
+        .create_stream(&s.donor, &s.ngo, &s.token.address, &1_000, &10);
+
+    assert_eq!(s.client.get_stream(&stream_id).balance, 1_000);
+}
+
+#[test]
+fn create_stream_fails_for_unverified_ngo() {
+    let (s, registry) = setup_with_registry();
+    s.token_admin.mint(&s.donor, &1_000);
+
+    // Registered but not approved (verified = false)
+    registry.register(&s.ngo, &soroban_sdk::String::from_str(&s.env, "Red Cross"));
+
+    let result = s
+        .client
+        .try_create_stream(&s.donor, &s.ngo, &s.token.address, &1_000, &10);
+    assert_eq!(result, Err(Ok(Error::NgoNotVerified)));
+
+    // No funds moved from donor
+    assert_eq!(s.token.balance(&s.donor), 1_000);
+}
+
+#[test]
+fn create_stream_fails_for_unregistered_ngo() {
+    let (s, _registry) = setup_with_registry();
+    s.token_admin.mint(&s.donor, &1_000);
+
+    // The NGO has no registry entry. try_get_ngo fails and maps to NgoNotVerified.
+    let result = s
+        .client
+        .try_create_stream(&s.donor, &s.ngo, &s.token.address, &1_000, &10);
+    assert_eq!(result, Err(Ok(Error::NgoNotVerified)));
+
+    assert_eq!(s.token.balance(&s.donor), 1_000);
+}
+
+#[test]
+fn create_stream_fails_for_revoked_ngo() {
+    let (s, registry) = setup_with_registry();
+    s.token_admin.mint(&s.donor, &1_000);
+
+    // Register, approve, then revoke
+    registry.register(&s.ngo, &soroban_sdk::String::from_str(&s.env, "Red Cross"));
+    registry.approve_ngo(&s.ngo);
+    registry.revoke_ngo(&s.ngo);
+
+    let result = s
+        .client
+        .try_create_stream(&s.donor, &s.ngo, &s.token.address, &1_000, &10);
+    assert_eq!(result, Err(Ok(Error::NgoNotVerified)));
+
+    assert_eq!(s.token.balance(&s.donor), 1_000);
+}
+
+#[test]
+fn create_stream_skips_verification_when_no_registry_configured() {
+    let s = setup();
+    s.token_admin.mint(&s.donor, &1_000);
+
+    // Without set_registry, registry() is None; create_stream skips the verification branch
+    assert_eq!(s.client.registry(), None);
+    let stream_id = s
+        .client
+        .create_stream(&s.donor, &s.ngo, &s.token.address, &1_000, &10);
+
+    assert_eq!(s.client.get_stream(&stream_id).balance, 1_000);
 }
 
