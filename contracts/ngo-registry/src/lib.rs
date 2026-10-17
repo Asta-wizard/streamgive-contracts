@@ -660,6 +660,33 @@ impl NgoRegistry {
             .ok_or(Error::NotRegistered)
     }
 
+    /// Returns whether an address is a registered, verified NGO.
+    /// Unknown and unverified addresses both return `false`.
+    /// Never errors or panics.
+    ///
+    /// # Examples
+    ///
+    /// ```rust,no_run
+    /// # use soroban_sdk::{testutils::Address as _, Address, Env, String};
+    /// # use ngo_registry::{NgoRegistry, NgoRegistryArgs, NgoRegistryClient};
+    /// # let env = Env::default();
+    /// # env.mock_all_auths();
+    /// # let admin = Address::generate(&env);
+    /// # let contract_id = env.register(NgoRegistry, NgoRegistryArgs::__constructor(&admin));
+    /// # let client = NgoRegistryClient::new(&env, &contract_id);
+    /// let owner = Address::generate(&env);
+    /// let name = String::from_str(&env, "Example NGO");
+    /// client.register(&owner, &name);
+    /// assert!(!client.is_verified(&owner));
+    /// client.approve_ngo(&owner);
+    /// assert!(client.is_verified(&owner));
+    /// ```
+    pub fn is_verified(env: Env, owner: Address) -> bool {
+        Self::get_ngo(env, owner)
+            .map(|ngo| ngo.verified)
+            .unwrap_or(false)
+    }
+
     /// Reads back the total number of registered NGOs.
     ///
     /// Lets callers (such as the impact page) display the total count

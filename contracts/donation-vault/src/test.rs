@@ -2396,6 +2396,9 @@ fn admin_entry_points_require_admin_auth() {
 
     s.client.clear_token_fee_bps(&s.token.address);
     assert_auth_required_from(&s, &admin, "clear_token_fee_bps");
+
+    s.client.set_registry(&Address::generate(&s.env));
+    assert_auth_required_from(&s, &admin, "set_registry");
 }
 
 #[test]
@@ -3123,19 +3126,6 @@ fn rescue_stream_fails_for_non_admin_caller() {
         .client
         .create_stream(&s.donor, &s.ngo, &s.token.address, &1_000, &10);
 
-    let config_before = s.client.get_config();
-    let stream_before = s.client.get_stream(&stream_id);
-
-    // Negative case: attempting an upgrade with an unuploaded wasm hash fails
-    let unuploaded_hash = BytesN::from_array(&s.env, &[99u8; 32]);
-    assert!(s.client.try_upgrade(&unuploaded_hash).is_err());
-
-    // State reads back identically after
-    let config_after = s.client.get_config();
-    let stream_after = s.client.get_stream(&stream_id);
-    assert_eq!(config_before, config_after);
-    assert_eq!(stream_before, stream_after);
-}
     s.client.pause();
 
     let non_admin = Address::generate(&s.env);
@@ -3166,5 +3156,447 @@ fn rescue_stream_fails_without_admin_auth() {
 
     s.env.mock_auths(&[]);
     s.client.rescue_stream(&stream_id);
+}
+
+// =============================================================================
+// NGO registry cross-contract verification & set_registry tests (issue #287)
+// =============================================================================
+
+fn setup_with_registry() -> (Setup<'static>, ngo_registry::NgoRegistryClient<'static>) {
+    let s = setup();
+
+    let admin = s.client.admin();
+    let registry_id = s.env.register(
+        ngo_registry::NgoRegistry,
+        ngo_registry::NgoRegistryArgs::__constructor(&admin),
+    );
+    let registry_client = ngo_registry::NgoRegistryClient::new(&s.env, &registry_id);
+
+    s.client.set_registry(&registry_id);
+
+    (s, registry_client)
+}
+
+#[test]
+fn set_registry_and_registry_getter() {
+    let s = setup();
+    assert_eq!(s.client.registry(), None);
+    assert_eq!(s.client.get_config().registry, None);
+
+    let registry_addr = Address::generate(&s.env);
+    s.client.set_registry(&registry_addr);
+
+    assert_eq!(s.client.registry(), Some(registry_addr.clone()));
+    assert_eq!(s.client.get_config().registry, Some(registry_addr));
+}
+
+#[test]
+fn set_registry_requires_admin_auth() {
+    let s = setup();
+    let admin = s.client.admin();
+    let registry_addr = Address::generate(&s.env);
+
+    s.client.set_registry(&registry_addr);
+    assert_auth_required_from(&s, &admin, "set_registry");
+}
+
+#[test]
+#[should_panic]
+fn set_registry_fails_without_admin_auth() {
+    let s = setup();
+    let registry_addr = Address::generate(&s.env);
+
+    s.env.mock_auths(&[]);
+    s.client.set_registry(&registry_addr);
+}
+
+#[test]
+#[should_panic]
+fn set_registry_rejects_non_admin() {
+    let s = setup();
+    let non_admin = Address::generate(&s.env);
+    let registry_addr = Address::generate(&s.env);
+
+    s.env.mock_auths(&[MockAuth {
+        address: &non_admin,
+        invoke: &MockAuthInvoke {
+            contract: &s.client.address,
+            fn_name: "set_registry",
+            args: (registry_addr.clone(),).into_val(&s.env),
+            sub_invokes: &[],
+        },
+    }]);
+
+    s.client.set_registry(&registry_addr);
+}
+
+#[test]
+fn create_stream_succeeds_for_verified_ngo() {
+    let (s, registry) = setup_with_registry();
+    s.token_admin.mint(&s.donor, &1_000);
+
+    registry.register(&s.ngo, &soroban_sdk::String::from_str(&s.env, "Red Cross"));
+    registry.approve_ngo(&s.ngo);
+
+    let stream_id = s
+        .client
+        .create_stream(&s.donor, &s.ngo, &s.token.address, &1_000, &10);
+
+    assert_eq!(s.client.get_stream(&stream_id).balance, 1_000);
+}
+
+#[test]
+fn create_stream_fails_for_unverified_ngo() {
+    let (s, registry) = setup_with_registry();
+    s.token_admin.mint(&s.donor, &1_000);
+
+    // Registered but not approved (verified = false)
+    registry.register(&s.ngo, &soroban_sdk::String::from_str(&s.env, "Red Cross"));
+
+    let result = s
+        .client
+        .try_create_stream(&s.donor, &s.ngo, &s.token.address, &1_000, &10);
+    assert_eq!(result, Err(Ok(Error::NgoNotVerified)));
+
+    // No funds moved from donor
+    assert_eq!(s.token.balance(&s.donor), 1_000);
+}
+
+#[test]
+fn create_stream_fails_for_unregistered_ngo() {
+    let (s, _registry) = setup_with_registry();
+    s.token_admin.mint(&s.donor, &1_000);
+
+    // The NGO has no registry entry. try_get_ngo fails and maps to NgoNotVerified.
+    let result = s
+        .client
+        .try_create_stream(&s.donor, &s.ngo, &s.token.address, &1_000, &10);
+    assert_eq!(result, Err(Ok(Error::NgoNotVerified)));
+
+    assert_eq!(s.token.balance(&s.donor), 1_000);
+}
+
+#[test]
+fn create_stream_fails_for_revoked_ngo() {
+    let (s, registry) = setup_with_registry();
+    s.token_admin.mint(&s.donor, &1_000);
+
+    // Register, approve, then revoke
+    registry.register(&s.ngo, &soroban_sdk::String::from_str(&s.env, "Red Cross"));
+    registry.approve_ngo(&s.ngo);
+    registry.revoke_ngo(&s.ngo);
+
+    let result = s
+        .client
+        .try_create_stream(&s.donor, &s.ngo, &s.token.address, &1_000, &10);
+    assert_eq!(result, Err(Ok(Error::NgoNotVerified)));
+
+    assert_eq!(s.token.balance(&s.donor), 1_000);
+}
+
+#[test]
+fn create_stream_skips_verification_when_no_registry_configured() {
+    let s = setup();
+    s.token_admin.mint(&s.donor, &1_000);
+
+    // Without set_registry, registry() is None; create_stream skips the verification branch
+    assert_eq!(s.client.registry(), None);
+    let stream_id = s
+        .client
+        .create_stream(&s.donor, &s.ngo, &s.token.address, &1_000, &10);
+
+    assert_eq!(s.client.get_stream(&stream_id).balance, 1_000);
+}
+
+// =============================================================================
+// withdraw_batch tests (issue #285)
+// =============================================================================
+
+#[test]
+fn withdraw_batch_across_several_streams() {
+    let s = setup();
+    let treasury = Address::generate(&s.env);
+    s.client.set_treasury(&treasury);
+    s.client.set_fee_bps(&500); // 5% global fee
+
+    s.token_admin.mint(&s.donor, &5_000);
+
+    let s1 = s
+        .client
+        .create_stream(&s.donor, &s.ngo, &s.token.address, &1_000, &10);
+    let s2 = s
+        .client
+        .create_stream(&s.donor, &s.ngo, &s.token.address, &2_000, &20);
+    let s3 = s
+        .client
+        .create_stream(&s.donor, &s.ngo, &s.token.address, &1_000, &10);
+
+    s.env.ledger().with_mut(|l| l.timestamp += 50);
+
+    let mut ids = Vec::new(&s.env);
+    ids.push_back(s1);
+    ids.push_back(s2);
+    ids.push_back(s3);
+
+    let amounts = s.client.withdraw_batch(&ids);
+
+    // Accruals: 50 * 10 = 500, 50 * 20 = 1000, 50 * 10 = 500
+    assert_eq!(amounts.get(0), Some(500));
+    assert_eq!(amounts.get(1), Some(1_000));
+    assert_eq!(amounts.get(2), Some(500));
+
+    let gross: i128 = 500 + 1_000 + 500;
+    let fee: i128 = (gross * 500) / 10_000; // 100
+    let net: i128 = gross - fee; // 1900
+    assert_eq!(gross, net + fee);
+
+    assert_eq!(s.token.balance(&s.ngo), net);
+    assert_eq!(s.token.balance(&treasury), fee);
+    assert_eq!(s.token.balance(&s.client.address), 4_000 - gross); // 4000 deposited, 2000 drawn
+
+    // Verify stream states
+    let stream1 = s.client.get_stream(&s1);
+    assert_eq!(stream1.balance, 500);
+    assert_eq!(stream1.withdrawn, 500);
+    assert_eq!(stream1.status, StreamStatus::Active);
+    assert_eq!(stream1.last_update, s.env.ledger().timestamp());
+
+    let stream2 = s.client.get_stream(&s2);
+    assert_eq!(stream2.balance, 1_000);
+    assert_eq!(stream2.withdrawn, 1_000);
+    assert_eq!(stream2.status, StreamStatus::Active);
+    assert_eq!(stream2.last_update, s.env.ledger().timestamp());
+
+    let stream3 = s.client.get_stream(&s3);
+    assert_eq!(stream3.balance, 500);
+    assert_eq!(stream3.withdrawn, 500);
+    assert_eq!(stream3.status, StreamStatus::Active);
+    assert_eq!(stream3.last_update, s.env.ledger().timestamp());
+}
+
+#[test]
+fn withdraw_batch_rejects_mixed_ngos() {
+    let s = setup();
+    let ngo_b = Address::generate(&s.env);
+    s.token_admin.mint(&s.donor, &2_000);
+
+    let s1 = s
+        .client
+        .create_stream(&s.donor, &s.ngo, &s.token.address, &1_000, &10);
+    let s2 = s
+        .client
+        .create_stream(&s.donor, &ngo_b, &s.token.address, &1_000, &10);
+
+    let mut ids = Vec::new(&s.env);
+    ids.push_back(s1);
+    ids.push_back(s2);
+
+    let result = s.client.try_withdraw_batch(&ids);
+    assert_eq!(result, Err(Ok(Error::MixedNgo)));
+}
+
+#[test]
+fn withdraw_batch_skips_stream_with_zero_accrual() {
+    let s = setup();
+    s.token_admin.mint(&s.donor, &2_000);
+
+    let s1 = s
+        .client
+        .create_stream(&s.donor, &s.ngo, &s.token.address, &1_000, &10);
+    let s2 = s
+        .client
+        .create_stream(&s.donor, &s.ngo, &s.token.address, &1_000, &10);
+
+    s.env.ledger().with_mut(|l| l.timestamp += 20);
+
+    // Settle s1 first
+    s.client.withdraw(&s1);
+
+    // At the current timestamp, s1 has 0 new accrual, while s2 has 200
+    let mut ids = Vec::new(&s.env);
+    ids.push_back(s1);
+    ids.push_back(s2);
+
+    let amounts = s.client.withdraw_batch(&ids);
+    assert_eq!(amounts.get(0), Some(0));
+    assert_eq!(amounts.get(1), Some(200));
+
+    let stream1 = s.client.get_stream(&s1);
+    assert_eq!(stream1.balance, 800);
+    assert_eq!(stream1.withdrawn, 200);
+
+    let stream2 = s.client.get_stream(&s2);
+    assert_eq!(stream2.balance, 800);
+    assert_eq!(stream2.withdrawn, 200);
+}
+
+#[test]
+fn withdraw_batch_multi_token_fee_aggregation_and_override() {
+    let s = setup();
+    let treasury = Address::generate(&s.env);
+    s.client.set_treasury(&treasury);
+    s.client.set_fee_bps(&500); // 5% global fee
+
+    let token_b_admin_addr = Address::generate(&s.env);
+    let (token_b, token_b_admin) = create_token(&s.env, &token_b_admin_addr);
+    s.client.set_token_fee_bps(&token_b.address, &1_000); // 10% fee override
+
+    s.token_admin.mint(&s.donor, &3_000);
+    token_b_admin.mint(&s.donor, &3_000);
+
+    let s1 = s
+        .client
+        .create_stream(&s.donor, &s.ngo, &s.token.address, &1_000, &10);
+    let s2 = s
+        .client
+        .create_stream(&s.donor, &s.ngo, &s.token.address, &2_000, &10);
+    let s3 = s
+        .client
+        .create_stream(&s.donor, &s.ngo, &token_b.address, &2_000, &20);
+
+    s.env.ledger().with_mut(|l| l.timestamp += 50);
+
+    let mut ids = Vec::new(&s.env);
+    ids.push_back(s1);
+    ids.push_back(s2);
+    ids.push_back(s3);
+
+    let amounts = s.client.withdraw_batch(&ids);
+    assert_eq!(amounts.get(0), Some(500));
+    assert_eq!(amounts.get(1), Some(500));
+    assert_eq!(amounts.get(2), Some(1_000));
+
+    // Token A: 500 + 500 = 1000 gross. Global fee 5% = 50 fee, 950 net.
+    let token_a_gross: i128 = 1_000;
+    let token_a_fee: i128 = 50;
+    let token_a_net: i128 = 950;
+    assert_eq!(token_a_gross, token_a_net + token_a_fee);
+    assert_eq!(s.token.balance(&s.ngo), token_a_net);
+    assert_eq!(s.token.balance(&treasury), token_a_fee);
+
+    // Token B: 1000 gross. Override fee 10% = 100 fee, 900 net.
+    let token_b_gross: i128 = 1_000;
+    let token_b_fee: i128 = 100;
+    let token_b_net: i128 = 900;
+    assert_eq!(token_b_gross, token_b_net + token_b_fee);
+    assert_eq!(token_b.balance(&s.ngo), token_b_net);
+    assert_eq!(token_b.balance(&treasury), token_b_fee);
+}
+
+#[test]
+fn withdraw_batch_requires_ngo_auth() {
+    let s = setup();
+    s.token_admin.mint(&s.donor, &1_000);
+
+    let stream_id = s
+        .client
+        .create_stream(&s.donor, &s.ngo, &s.token.address, &1_000, &10);
+    s.env.ledger().with_mut(|l| l.timestamp += 10);
+
+    let mut ids = Vec::new(&s.env);
+    ids.push_back(stream_id);
+
+    s.client.withdraw_batch(&ids);
+    assert_auth_required_from(&s, &s.ngo, "withdraw_batch");
+}
+
+#[test]
+#[should_panic]
+fn withdraw_batch_fails_without_ngo_auth() {
+    let s = setup();
+    s.token_admin.mint(&s.donor, &1_000);
+
+    let stream_id = s
+        .client
+        .create_stream(&s.donor, &s.ngo, &s.token.address, &1_000, &10);
+    s.env.ledger().with_mut(|l| l.timestamp += 10);
+
+    let mut ids = Vec::new(&s.env);
+    ids.push_back(stream_id);
+
+    s.env.mock_auths(&[]);
+    s.client.withdraw_batch(&ids);
+}
+
+#[test]
+#[should_panic]
+fn withdraw_batch_rejects_non_ngo_caller() {
+    let s = setup();
+    s.token_admin.mint(&s.donor, &1_000);
+
+    let stream_id = s
+        .client
+        .create_stream(&s.donor, &s.ngo, &s.token.address, &1_000, &10);
+    s.env.ledger().with_mut(|l| l.timestamp += 10);
+
+    let mut ids = Vec::new(&s.env);
+    ids.push_back(stream_id);
+
+    let attacker = Address::generate(&s.env);
+    s.env.mock_auths(&[MockAuth {
+        address: &attacker,
+        invoke: &MockAuthInvoke {
+            contract: &s.client.address,
+            fn_name: "withdraw_batch",
+            args: (ids.clone(),).into_val(&s.env),
+            sub_invokes: &[],
+        },
+    }]);
+
+    s.client.withdraw_batch(&ids);
+}
+
+#[test]
+fn withdraw_batch_empty_batch_returns_empty_and_succeeds() {
+    let s = setup();
+    let ids = Vec::new(&s.env);
+    let amounts = s.client.withdraw_batch(&ids);
+    assert_eq!(amounts.len(), 0);
+}
+
+#[test]
+fn withdraw_batch_unknown_stream_returns_stream_not_found() {
+    let s = setup();
+    let mut ids = Vec::new(&s.env);
+    ids.push_back(99_999u64);
+
+    let result = s.client.try_withdraw_batch(&ids);
+    assert_eq!(result, Err(Ok(Error::StreamNotFound)));
+}
+
+#[test]
+fn withdraw_batch_with_cancelled_stream_skips_cancelled_accrual() {
+    let s = setup();
+    s.token_admin.mint(&s.donor, &2_000);
+
+    let s1 = s
+        .client
+        .create_stream(&s.donor, &s.ngo, &s.token.address, &1_000, &10);
+    let s2 = s
+        .client
+        .create_stream(&s.donor, &s.ngo, &s.token.address, &1_000, &10);
+
+    // Cancel s1: donor refunded 1000, s1 rate=0, balance=0, cancelled=true
+    s.client.cancel_stream(&s1);
+
+    s.env.ledger().with_mut(|l| l.timestamp += 20);
+
+    let mut ids = Vec::new(&s.env);
+    ids.push_back(s1);
+    ids.push_back(s2);
+
+    let amounts = s.client.withdraw_batch(&ids);
+    assert_eq!(amounts.get(0), Some(0));
+    assert_eq!(amounts.get(1), Some(200));
+
+    let stream1 = s.client.get_stream(&s1);
+    assert!(stream1.cancelled);
+    assert_eq!(stream1.balance, 0);
+
+    let stream2 = s.client.get_stream(&s2);
+    assert_eq!(stream2.balance, 800);
+    assert_eq!(stream2.withdrawn, 200);
+
+    assert_eq!(s.token.balance(&s.ngo), 200);
 }
 

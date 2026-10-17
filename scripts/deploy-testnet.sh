@@ -53,6 +53,60 @@ check_prerequisites
 ADMIN_ADDRESS="${STELLAR_ADMIN_ADDRESS:-$(stellar keys address "$SOURCE_ACCOUNT")}"
 echo "Admin address: $ADMIN_ADDRESS"
 
+# Optional vault configuration environment variables:
+#   STELLAR_REGISTRY_ADDRESS - Address of ngo-registry (C... or G...) or "auto" to use newly deployed registry. Default: unset.
+#   STELLAR_TREASURY_ADDRESS - Address of fee recipient treasury (C... or G...). Default: unset.
+#   STELLAR_FEE_BPS          - Global protocol fee in basis points (0-1000). Default: unset (0).
+#                              Requires STELLAR_TREASURY_ADDRESS if > 0.
+#   STELLAR_MIN_DEPOSIT      - Minimum stream deposit in stroops (integer >= 0). Default: unset (0).
+
+validate_address() {
+  local val="$1"
+  local var_name="$2"
+  if ! [[ "$val" =~ ^[GC][A-Z2-7]{55}$ ]]; then
+    echo "Error: $var_name is not a valid Stellar address (G... or C...): $val" >&2
+    exit 1
+  fi
+}
+
+validate_config_inputs() {
+  if [ -n "${STELLAR_ADMIN_ADDRESS:-}" ]; then
+    validate_address "$ADMIN_ADDRESS" "STELLAR_ADMIN_ADDRESS"
+  fi
+
+  if [ -n "${STELLAR_REGISTRY_ADDRESS:-}" ] && [ "$STELLAR_REGISTRY_ADDRESS" != "auto" ]; then
+    validate_address "$STELLAR_REGISTRY_ADDRESS" "STELLAR_REGISTRY_ADDRESS"
+  fi
+
+  if [ -n "${STELLAR_TREASURY_ADDRESS:-}" ]; then
+    validate_address "$STELLAR_TREASURY_ADDRESS" "STELLAR_TREASURY_ADDRESS"
+  fi
+
+  if [ -n "${STELLAR_FEE_BPS:-}" ]; then
+    if ! [[ "$STELLAR_FEE_BPS" =~ ^[0-9]+$ ]]; then
+      echo "Error: STELLAR_FEE_BPS must be a non-negative integer: $STELLAR_FEE_BPS" >&2
+      exit 1
+    fi
+    if [ "$STELLAR_FEE_BPS" -gt 1000 ]; then
+      echo "Error: STELLAR_FEE_BPS cannot exceed 1000 (10% max fee): $STELLAR_FEE_BPS" >&2
+      exit 1
+    fi
+    if [ "$STELLAR_FEE_BPS" -gt 0 ] && [ -z "${STELLAR_TREASURY_ADDRESS:-}" ]; then
+      echo "Error: Setting STELLAR_FEE_BPS > 0 requires STELLAR_TREASURY_ADDRESS to be set." >&2
+      exit 1
+    fi
+  fi
+
+  if [ -n "${STELLAR_MIN_DEPOSIT:-}" ]; then
+    if ! [[ "$STELLAR_MIN_DEPOSIT" =~ ^[0-9]+$ ]]; then
+      echo "Error: STELLAR_MIN_DEPOSIT must be a non-negative integer: $STELLAR_MIN_DEPOSIT" >&2
+      exit 1
+    fi
+  fi
+}
+
+validate_config_inputs
+
 echo "Building contracts (release, wasm32v1-none)..."
 cargo build --workspace --target wasm32v1-none --release
 
@@ -66,6 +120,14 @@ deploy_contract() {
     --admin "$ADMIN_ADDRESS"
 }
 
+invoke_vault() {
+  stellar contract invoke \
+    --id "$DONATION_VAULT_ID" \
+    --source "$SOURCE_ACCOUNT" \
+    --network "$NETWORK" \
+    -- "$@"
+}
+
 echo "Deploying and initializing ngo-registry (admin: $ADMIN_ADDRESS)..."
 NGO_REGISTRY_ID=$(deploy_contract "ngo_registry")
 echo "  -> $NGO_REGISTRY_ID"
@@ -73,6 +135,58 @@ echo "  -> $NGO_REGISTRY_ID"
 echo "Deploying and initializing donation-vault (admin: $ADMIN_ADDRESS)..."
 DONATION_VAULT_ID=$(deploy_contract "donation_vault")
 echo "  -> $DONATION_VAULT_ID"
+
+# Apply optional post-init configuration to the vault
+REGISTRY_TO_SET=""
+if [ -n "${STELLAR_REGISTRY_ADDRESS:-}" ]; then
+  if [ "$STELLAR_REGISTRY_ADDRESS" = "auto" ]; then
+    REGISTRY_TO_SET="$NGO_REGISTRY_ID"
+  else
+    REGISTRY_TO_SET="$STELLAR_REGISTRY_ADDRESS"
+  fi
+fi
+
+if [ -n "$REGISTRY_TO_SET" ]; then
+  echo "Setting vault registry to $REGISTRY_TO_SET..."
+  invoke_vault set_registry --registry "$REGISTRY_TO_SET"
+else
+  echo "Notice: No registry configured (STELLAR_REGISTRY_ADDRESS is unset)."
+fi
+
+if [ -n "${STELLAR_TREASURY_ADDRESS:-}" ]; then
+  echo "Setting vault treasury to $STELLAR_TREASURY_ADDRESS..."
+  invoke_vault set_treasury --treasury "$STELLAR_TREASURY_ADDRESS"
+fi
+
+if [ -n "${STELLAR_FEE_BPS:-}" ]; then
+  echo "Setting vault fee_bps to $STELLAR_FEE_BPS..."
+  invoke_vault set_fee_bps --fee_bps "$STELLAR_FEE_BPS"
+fi
+
+if [ -n "${STELLAR_MIN_DEPOSIT:-}" ]; then
+  echo "Setting vault min_deposit to $STELLAR_MIN_DEPOSIT..."
+  invoke_vault set_min_deposit --min_deposit "$STELLAR_MIN_DEPOSIT"
+fi
+
+echo "Verifying vault admin..."
+ACTUAL_ADMIN=$(invoke_vault admin | tr -d '"')
+if [ "$ACTUAL_ADMIN" != "$ADMIN_ADDRESS" ]; then
+  echo "Error: Vault admin verification failed! Expected: $ADMIN_ADDRESS, got: $ACTUAL_ADMIN" >&2
+  exit 1
+fi
+echo "  -> Admin verified: $ACTUAL_ADMIN"
+
+echo "Reading back final vault configuration..."
+ACTUAL_REGISTRY=$(invoke_vault registry | tr -d '"')
+CONFIG_RAW=$(invoke_vault get_config)
+
+echo "======================================================================"
+echo "Final Donation Vault Configuration:"
+echo "  Admin (verified via admin(); not exposed by get_config): $ACTUAL_ADMIN"
+echo "  Registry (verified via registry()):                      $ACTUAL_REGISTRY"
+echo "  Configuration (via get_config):"
+echo "$CONFIG_RAW"
+echo "======================================================================"
 
 # deploy-mainnet.sh records its deployment under a "mainnet" key in this same
 # file; rewriting the file must not lose it, so carry it over if present.
