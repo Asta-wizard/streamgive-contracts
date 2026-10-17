@@ -153,13 +153,20 @@ cargo build --workspace --target wasm32v1-none --release
 NGO_REGISTRY_ID=""
 DONATION_VAULT_ID=""
 
-# If anything fails after a contract is already on-chain, print what was
-# deployed so it isn't lost — nothing has been written to deployments.json.
+# If anything fails after a contract is already on-chain, fail loudly and
+# print what was deployed. Because contracts are initialized atomically via
+# __constructor at deploy time, deployed contracts are never left uninitialized
+# or claimable, but $DEPLOYMENTS_FILE has not yet recorded them.
 report_partial_deploy() {
   echo >&2
-  echo "Deploy failed part-way; $DEPLOYMENTS_FILE was NOT updated." >&2
+  echo "======================================================================" >&2
+  echo "ERROR: Mainnet deploy failed part-way! $DEPLOYMENTS_FILE was NOT updated." >&2
+  echo "Contracts are initialized atomically with admin $ADMIN_ADDRESS at deploy" >&2
+  echo "time and cannot be claimed by third parties, but manual recovery or" >&2
+  echo "record-keeping is required for any deployed contracts below:" >&2
   echo "  ngo-registry:   ${NGO_REGISTRY_ID:-<not deployed>}" >&2
   echo "  donation-vault: ${DONATION_VAULT_ID:-<not deployed>}" >&2
+  echo "======================================================================" >&2
 }
 trap report_partial_deploy ERR
 
@@ -170,30 +177,18 @@ deploy_contract() {
   stellar contract deploy \
     --wasm "$WASM_DIR/${wasm_name}.wasm" \
     --source "$SOURCE_ACCOUNT" \
-    "${stellar_network_args[@]}"
+    "${stellar_network_args[@]}" \
+    -- \
+    --admin "$ADMIN_ADDRESS"
 }
 
-echo "Deploying ngo-registry..."
+echo "Deploying and initializing ngo-registry (admin: $ADMIN_ADDRESS)..."
 NGO_REGISTRY_ID=$(deploy_contract "ngo_registry")
 echo "  -> $NGO_REGISTRY_ID"
 
-echo "Deploying donation-vault..."
+echo "Deploying and initializing donation-vault (admin: $ADMIN_ADDRESS)..."
 DONATION_VAULT_ID=$(deploy_contract "donation_vault")
 echo "  -> $DONATION_VAULT_ID"
-
-echo "Initializing ngo-registry (admin: $ADMIN_ADDRESS)..."
-stellar contract invoke \
-  --id "$NGO_REGISTRY_ID" \
-  --source "$SOURCE_ACCOUNT" \
-  "${stellar_network_args[@]}" \
-  -- init --admin "$ADMIN_ADDRESS"
-
-echo "Initializing donation-vault (admin: $ADMIN_ADDRESS)..."
-stellar contract invoke \
-  --id "$DONATION_VAULT_ID" \
-  --source "$SOURCE_ACCOUNT" \
-  "${stellar_network_args[@]}" \
-  -- init --admin "$ADMIN_ADDRESS"
 
 # Add the mainnet entry next to whatever is already in the file (the
 # testnet deployment lives at the top level), leaving that untouched.

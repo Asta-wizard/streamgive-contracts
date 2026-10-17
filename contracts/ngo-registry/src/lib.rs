@@ -78,6 +78,12 @@ pub enum DataKey {
     Ngo(Address),
     /// The total number of NGO records stored in the registry.
     NgoCount,
+    /// Current number of registered NGO owners in the index.
+    OwnerIndexCount,
+    /// Registered NGO owner at a specific index in the owners index.
+    OwnerByIndex(u32),
+    /// Index of a registered NGO owner in the owners index.
+    IndexByOwner(Address),
 }
 
 #[contracterror]
@@ -111,6 +117,10 @@ pub enum Error {
 /// organization name while keeping a single entry's storage bounded.
 const MAX_NGO_NAME_LEN: u32 = 200;
 
+/// Maximum number of NGO owners returned by `list_ngos` in a single page.
+/// Caps read footprint, memory, and gas consumption to keep pagination bounded.
+pub const MAX_LIST_LIMIT: u32 = 50;
+
 /// Approximate ledgers per day at a 5-second close time. Used to express
 /// storage TTLs (which the network counts in ledgers, not wall time) in
 /// human terms.
@@ -134,6 +144,32 @@ fn extend_ngo_ttl(env: &Env, owner: &Address) {
         NGO_LIFETIME_THRESHOLD,
         NGO_BUMP_AMOUNT,
     );
+}
+
+fn extend_owner_index_ttl(env: &Env, index: u32, owner: &Address) {
+    env.storage().persistent().extend_ttl(
+        &DataKey::OwnerByIndex(index),
+        NGO_LIFETIME_THRESHOLD,
+        NGO_BUMP_AMOUNT,
+    );
+    env.storage().persistent().extend_ttl(
+        &DataKey::IndexByOwner(owner.clone()),
+        NGO_LIFETIME_THRESHOLD,
+        NGO_BUMP_AMOUNT,
+    );
+}
+
+fn get_owner_count(env: &Env) -> u32 {
+    env.storage()
+        .instance()
+        .get(&DataKey::OwnerIndexCount)
+        .unwrap_or(0)
+}
+
+fn set_owner_count(env: &Env, count: u32) {
+    env.storage()
+        .instance()
+        .set(&DataKey::OwnerIndexCount, &count);
 }
 
 fn is_whitespace_only(name: &String) -> bool {
@@ -163,23 +199,29 @@ pub struct NgoRegistry;
 
 #[contractimpl]
 impl NgoRegistry {
-    /// Sets the registry admin. Can only be called once.
+    /// Initializes the registry with an administrator atomically at deployment time.
+    pub fn __constructor(env: Env, admin: Address) {
+        env.storage().instance().set(&DataKey::Admin, &admin);
+        extend_instance_ttl(&env);
+    }
+
+    /// Sets the registry admin. Can only be called once. Neutralized in favor of
+    /// `__constructor` for atomic deployment; requires admin auth.
     ///
     /// # Examples
     ///
     /// ```rust,no_run
     /// # use soroban_sdk::{testutils::Address as _, Address, Env};
-    /// # use ngo_registry::{NgoRegistry, NgoRegistryClient};
+    /// # use ngo_registry::{NgoRegistry, NgoRegistryArgs, NgoRegistryClient};
     /// let env = Env::default();
     /// env.mock_all_auths();
     ///
-    /// let contract_id = env.register(NgoRegistry, ());
-    /// let client = NgoRegistryClient::new(&env, &contract_id);
-    ///
     /// let admin = Address::generate(&env);
-    /// client.init(&admin);
+    /// let contract_id = env.register(NgoRegistry, NgoRegistryArgs::__constructor(&admin));
+    /// let client = NgoRegistryClient::new(&env, &contract_id);
     /// ```
     pub fn init(env: Env, admin: Address) -> Result<(), Error> {
+        admin.require_auth();
         if env.storage().instance().has(&DataKey::Admin) {
             return Err(Error::AlreadyInitialized);
         }
@@ -394,8 +436,23 @@ impl NgoRegistry {
             .instance()
             .set(&DataKey::NgoCount, &(count + 1));
 
+        // Maintain the registered owners index
+        let index = get_owner_count(&env);
+        env.storage()
+            .persistent()
+            .set(&DataKey::OwnerByIndex(index), &owner);
+        env.storage()
+            .persistent()
+            .set(&DataKey::IndexByOwner(owner.clone()), &index);
+        let new_count = index.checked_add(1).ok_or(Error::ArithmeticOverflow)?;
+        set_owner_count(&env, new_count);
+        env.storage()
+            .instance()
+            .set(&DataKey::TotalNgos, &new_count);
+
         extend_instance_ttl(&env);
         extend_ngo_ttl(&env, &owner);
+        extend_owner_index_ttl(&env, index, &owner);
 
         RegisterEvent { owner, name }.publish(&env);
 
@@ -428,10 +485,101 @@ impl NgoRegistry {
         }
 
         env.storage().persistent().remove(&key);
+
+        // Remove from index using swap-and-pop to maintain a dense [0..count) index
+        if let Some(index) = env
+            .storage()
+            .persistent()
+            .get::<_, u32>(&DataKey::IndexByOwner(owner.clone()))
+        {
+            let count = get_owner_count(&env);
+            if count > 0 {
+                let last_index = count - 1;
+                if index != last_index {
+                    if let Some(last_owner) = env
+                        .storage()
+                        .persistent()
+                        .get::<_, Address>(&DataKey::OwnerByIndex(last_index))
+                    {
+                        env.storage()
+                            .persistent()
+                            .set(&DataKey::OwnerByIndex(index), &last_owner);
+                        env.storage()
+                            .persistent()
+                            .set(&DataKey::IndexByOwner(last_owner.clone()), &index);
+                        extend_owner_index_ttl(&env, index, &last_owner);
+                    }
+                }
+                env.storage()
+                    .persistent()
+                    .remove(&DataKey::OwnerByIndex(last_index));
+                env.storage()
+                    .persistent()
+                    .remove(&DataKey::IndexByOwner(owner.clone()));
+                set_owner_count(&env, last_index);
+                env.storage()
+                    .instance()
+                    .set(&DataKey::TotalNgos, &last_index);
+            }
+        }
+
         extend_instance_ttl(&env);
         UnregisteredEvent { owner, data: () }.publish(&env);
 
         Ok(())
+    }
+
+    /// Returns a paginated list of registered NGO owner addresses.
+    ///
+    /// # Pagination Semantics
+    /// - `start`: The 0-based offset into the registered owners index. If `start` is
+    ///   greater than or equal to the total number of registered owners, an empty list is returned.
+    /// - `limit`: The maximum number of entries to return. Capped at `MAX_LIST_LIMIT` (50).
+    ///   If `limit == 0`, an empty list is returned.
+    /// - Ordering: Stable and deterministic. Entries are indexed in order of registration,
+    ///   with unregistration swapping the last entry into the vacated position (swap-and-pop)
+    ///   to keep persistent storage dense and bounded without reallocations.
+    ///
+    /// # Examples
+    ///
+    /// ```rust,no_run
+    /// # use soroban_sdk::{testutils::Address as _, Address, Env, String};
+    /// # use ngo_registry::{NgoRegistry, NgoRegistryArgs, NgoRegistryClient};
+    /// # let env = Env::default();
+    /// # env.mock_all_auths();
+    /// # let admin = Address::generate(&env);
+    /// # let contract_id = env.register(NgoRegistry, NgoRegistryArgs::__constructor(&admin));
+    /// # let client = NgoRegistryClient::new(&env, &contract_id);
+    /// let owner = Address::generate(&env);
+    /// client.register(&owner, &String::from_str(&env, "Example NGO"));
+    ///
+    /// let owners = client.list_ngos(&0, &10);
+    /// assert_eq!(owners.len(), 1);
+    /// assert_eq!(owners.get(0).unwrap(), owner);
+    /// ```
+    pub fn list_ngos(env: Env, start: u32, limit: u32) -> Vec<Address> {
+        let count = get_owner_count(&env);
+        if start >= count || limit == 0 {
+            return Vec::new(&env);
+        }
+
+        let effective_limit = limit.min(MAX_LIST_LIMIT);
+        let end = start
+            .checked_add(effective_limit)
+            .unwrap_or(count)
+            .min(count);
+
+        let mut owners = Vec::new(&env);
+        for index in start..end {
+            if let Some(owner) = env
+                .storage()
+                .persistent()
+                .get::<_, Address>(&DataKey::OwnerByIndex(index))
+            {
+                owners.push_back(owner);
+            }
+        }
+        owners
     }
 
     /// Changes the name on an NGO's own pending application, so a typo or
@@ -668,6 +816,13 @@ impl NgoRegistry {
         }
         extend_instance_ttl(&env);
         extend_ngo_ttl(&env, &owner);
+        if let Some(index) = env
+            .storage()
+            .persistent()
+            .get::<_, u32>(&DataKey::IndexByOwner(owner.clone()))
+        {
+            extend_owner_index_ttl(&env, index, &owner);
+        }
         Ok(())
     }
 

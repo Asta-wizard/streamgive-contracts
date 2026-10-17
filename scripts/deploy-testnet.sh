@@ -61,30 +61,18 @@ deploy_contract() {
   stellar contract deploy \
     --wasm "$WASM_DIR/${wasm_name}.wasm" \
     --source "$SOURCE_ACCOUNT" \
-    --network "$NETWORK"
+    --network "$NETWORK" \
+    -- \
+    --admin "$ADMIN_ADDRESS"
 }
 
-echo "Deploying ngo-registry..."
+echo "Deploying and initializing ngo-registry (admin: $ADMIN_ADDRESS)..."
 NGO_REGISTRY_ID=$(deploy_contract "ngo_registry")
 echo "  -> $NGO_REGISTRY_ID"
 
-echo "Deploying donation-vault..."
+echo "Deploying and initializing donation-vault (admin: $ADMIN_ADDRESS)..."
 DONATION_VAULT_ID=$(deploy_contract "donation_vault")
 echo "  -> $DONATION_VAULT_ID"
-
-echo "Initializing ngo-registry (admin: $ADMIN_ADDRESS)..."
-stellar contract invoke \
-  --id "$NGO_REGISTRY_ID" \
-  --source "$SOURCE_ACCOUNT" \
-  --network "$NETWORK" \
-  -- init --admin "$ADMIN_ADDRESS"
-
-echo "Initializing donation-vault (admin: $ADMIN_ADDRESS)..."
-stellar contract invoke \
-  --id "$DONATION_VAULT_ID" \
-  --source "$SOURCE_ACCOUNT" \
-  --network "$NETWORK" \
-  -- init --admin "$ADMIN_ADDRESS"
 
 # deploy-mainnet.sh records its deployment under a "mainnet" key in this same
 # file; rewriting the file must not lose it, so carry it over if present.
