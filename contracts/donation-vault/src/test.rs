@@ -1014,20 +1014,85 @@ fn compute_fee_avoids_overflow_near_i128_max() {
 #[test]
 fn get_config_reflects_admin_settings() {
     let s = setup();
-    let treasury = Address::generate(&s.env);
+    s.token_admin.mint(&s.donor, &5_000);
 
+    // 1. Initial default configuration
+    assert_eq!(
+        s.client.get_config(),
+        Config {
+            paused: false,
+            treasury: None,
+            fee_bps: 0,
+            min_deposit: 0,
+            max_streams_per_donor: 100,
+            registry: None,
+            cancel_grace_ledgers: 0,
+            total_donated: 0,
+            pending_admin: None,
+            renounced: false,
+        }
+    );
+
+    // 2. Set admin parameters
+    let treasury = Address::generate(&s.env);
+    let registry = Address::generate(&s.env);
     s.client.set_treasury(&treasury);
     s.client.set_fee_bps(&500);
+    s.client.set_min_deposit(&100);
+    s.client.set_max_streams_per_donor(&50);
+    s.client.set_registry(&registry);
+    s.client.set_cancel_grace_ledgers(&10);
     s.client.pause();
 
     assert_eq!(
         s.client.get_config(),
         Config {
             paused: true,
-            treasury: Some(treasury),
+            treasury: Some(treasury.clone()),
             fee_bps: 500,
+            min_deposit: 100,
+            max_streams_per_donor: 50,
+            registry: Some(registry.clone()),
+            cancel_grace_ledgers: 10,
+            total_donated: 0,
+            pending_admin: None,
+            renounced: false,
         }
     );
+
+    // 3. Proposed admin state change
+    let candidate = Address::generate(&s.env);
+    s.client.propose_admin(&candidate);
+    assert_eq!(s.client.get_config().pending_admin, Some(candidate));
+
+    // 4. Changed fee
+    s.client.set_fee_bps(&250);
+    assert_eq!(s.client.get_config().fee_bps, 250);
+
+    // 5. Unpause, make donations (create_stream and top_up) -> updates total_donated
+    s.client.unpause();
+    assert!(!s.client.get_config().paused);
+
+    let stream_id = s
+        .client
+        .create_stream(&s.donor, &s.ngo, &s.token.address, &1_000, &10);
+    assert_eq!(s.client.get_config().total_donated, 1_000);
+
+    s.client.top_up(&stream_id, &500);
+    assert_eq!(s.client.get_config().total_donated, 1_500);
+
+    // 6. Renounce admin -> renounced = true, pending_admin = None
+    s.client.renounce_admin();
+    let final_config = s.client.get_config();
+    assert!(final_config.renounced);
+    assert_eq!(final_config.pending_admin, None);
+    assert_eq!(final_config.total_donated, 1_500);
+    assert_eq!(final_config.treasury, Some(treasury));
+    assert_eq!(final_config.fee_bps, 250);
+    assert_eq!(final_config.min_deposit, 100);
+    assert_eq!(final_config.max_streams_per_donor, 50);
+    assert_eq!(final_config.registry, Some(registry));
+    assert_eq!(final_config.cancel_grace_ledgers, 10);
 }
 
 #[test]

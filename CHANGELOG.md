@@ -63,6 +63,10 @@ This project does not yet follow a formal versioning scheme — each contract's
 
 ### Changed
 
+- `donation-vault`: `get_config` returns an extended `Config` struct that includes
+  `min_deposit`, `max_streams_per_donor`, `registry`, `cancel_grace_ledgers`,
+  `total_donated`, `pending_admin`, and `renounced`. Clients decoding the old
+  struct shape will need updating.
 - `donation-vault`: stream `balance`/`withdrawn` updates and the stream-id
   counter use checked arithmetic, returning `Error::ArithmeticOverflow`
   instead of panicking on overflow.

@@ -180,12 +180,20 @@ pub enum StreamStatus {
     Drained,
 }
 
+/// All admin configuration and global contract parameters returned by `get_config`.
 #[contracttype]
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Config {
     pub paused: bool,
     pub treasury: Option<Address>,
     pub fee_bps: u32,
+    pub min_deposit: i128,
+    pub max_streams_per_donor: u64,
+    pub registry: Option<Address>,
+    pub cancel_grace_ledgers: u32,
+    pub total_donated: i128,
+    pub pending_admin: Option<Address>,
+    pub renounced: bool,
 }
 
 #[contracttype]
@@ -1056,7 +1064,10 @@ impl DonationVault {
             .unwrap_or(false)
     }
 
-    /// Reads back all admin-set configuration in one call.
+    /// Reads back all admin-set configuration and contract state parameters in one call:
+    /// `paused`, `treasury`, `fee_bps`, `min_deposit`, `max_streams_per_donor`,
+    /// `registry`, `cancel_grace_ledgers`, `total_donated`, `pending_admin`, and
+    /// `renounced`.
     pub fn get_config(env: Env) -> Config {
         Config {
             paused: env
@@ -1066,6 +1077,33 @@ impl DonationVault {
                 .unwrap_or(false),
             treasury: env.storage().instance().get(&DataKey::Treasury),
             fee_bps: env.storage().instance().get(&DataKey::FeeBps).unwrap_or(0),
+            min_deposit: env
+                .storage()
+                .instance()
+                .get(&DataKey::MinDeposit)
+                .unwrap_or(0),
+            max_streams_per_donor: env
+                .storage()
+                .instance()
+                .get(&DataKey::MaxStreamsPerDonor)
+                .unwrap_or(DEFAULT_MAX_STREAMS_PER_DONOR),
+            registry: env.storage().instance().get(&DataKey::Registry),
+            cancel_grace_ledgers: env
+                .storage()
+                .instance()
+                .get(&DataKey::CancelGraceLedgers)
+                .unwrap_or(0),
+            total_donated: env
+                .storage()
+                .instance()
+                .get(&DataKey::TotalDonated)
+                .unwrap_or(0),
+            pending_admin: env.storage().instance().get(&DataKey::PendingAdmin),
+            renounced: env
+                .storage()
+                .instance()
+                .get(&DataKey::AdminRenounced)
+                .unwrap_or(false),
         }
     }
 
