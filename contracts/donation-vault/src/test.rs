@@ -94,11 +94,9 @@ fn setup() -> Setup<'static> {
     let env = Env::default();
     env.mock_all_auths();
 
-    let contract_id = env.register(DonationVault, ());
-    let client = DonationVaultClient::new(&env, &contract_id);
-
     let admin = Address::generate(&env);
-    client.init(&admin);
+    let contract_id = env.register(DonationVault, DonationVaultArgs::__constructor(&admin));
+    let client = DonationVaultClient::new(&env, &contract_id);
 
     let token_admin_addr = Address::generate(&env);
     let (token, token_admin) = create_token(&env, &token_admin_addr);
@@ -2126,26 +2124,65 @@ fn renounce_admin_clears_admin_and_pending_proposal() {
 fn renounce_admin_disables_admin_gated_calls() {
     let s = setup();
     let admin = s.client.admin();
+    let new_admin = Address::generate(&s.env);
+    let treasury = Address::generate(&s.env);
 
     s.client.renounce_admin();
     assert_auth_required_from(&s, &admin, "renounce_admin");
 
-    // Admin-gated entry points must now fail cleanly rather than succeed.
-    assert!(s.client.try_pause().is_err());
-    assert!(s.client.try_unpause().is_err());
-    assert!(s
-        .client
-        .try_set_treasury(&Address::generate(&s.env))
-        .is_err());
-    assert!(s.client.try_clear_treasury().is_err());
-    assert!(s.client.try_set_fee_bps(&100).is_err());
-    assert!(s
-        .client
-        .try_propose_admin(&Address::generate(&s.env))
-        .is_err());
-    assert!(s.client.try_cancel_admin_proposal().is_err());
-    assert!(s.client.try_set_min_deposit(&1_000).is_err());
-    assert!(s.client.try_set_max_streams_per_donor(&5).is_err());
+    // Admin-gated entry points must fail specifically with AdminRenounced.
+    assert_eq!(s.client.try_pause(), Err(Ok(Error::AdminRenounced)));
+    assert_eq!(s.client.try_unpause(), Err(Ok(Error::AdminRenounced)));
+    assert_eq!(
+        s.client.try_set_treasury(&treasury),
+        Err(Ok(Error::AdminRenounced))
+    );
+    assert_eq!(s.client.try_clear_treasury(), Err(Ok(Error::AdminRenounced)));
+    assert_eq!(s.client.try_set_fee_bps(&100), Err(Ok(Error::AdminRenounced)));
+    assert_eq!(
+        s.client.try_propose_admin(&new_admin),
+        Err(Ok(Error::AdminRenounced))
+    );
+    assert_eq!(
+        s.client.try_cancel_admin_proposal(),
+        Err(Ok(Error::AdminRenounced))
+    );
+    assert_eq!(
+        s.client.try_set_min_deposit(&1_000),
+        Err(Ok(Error::AdminRenounced))
+    );
+    assert_eq!(
+        s.client.try_set_max_streams_per_donor(&5),
+        Err(Ok(Error::AdminRenounced))
+    );
+}
+
+#[test]
+fn renounce_admin_returns_admin_renounced_for_admin_init_propose_and_pause() {
+    let s = setup();
+    let admin = s.client.admin();
+    let candidate = Address::generate(&s.env);
+
+    s.client.renounce_admin();
+    assert_auth_required_from(&s, &admin, "renounce_admin");
+
+    // admin() returns AdminRenounced
+    assert_eq!(s.client.try_admin(), Err(Ok(Error::AdminRenounced)));
+
+    // init() (re-initialisation after renounce) returns AdminRenounced
+    assert_eq!(
+        s.client.try_init(&candidate),
+        Err(Ok(Error::AdminRenounced))
+    );
+
+    // propose_admin() returns AdminRenounced
+    assert_eq!(
+        s.client.try_propose_admin(&candidate),
+        Err(Ok(Error::AdminRenounced))
+    );
+
+    // pause() returns AdminRenounced
+    assert_eq!(s.client.try_pause(), Err(Ok(Error::AdminRenounced)));
 }
 
 #[test]
@@ -2153,8 +2190,11 @@ fn renounce_admin_without_admin_fails() {
     let s = setup();
     s.client.renounce_admin();
 
-    // A second renounce has no admin to authorize it and must fail.
-    assert!(s.client.try_renounce_admin().is_err());
+    // A second renounce fails with AdminRenounced because admin control is permanently renounced.
+    assert_eq!(
+        s.client.try_renounce_admin(),
+        Err(Ok(Error::AdminRenounced))
+    );
 }
 
 /// Rewrites a stored stream in place, for pushing its bookkeeping to the
@@ -2405,8 +2445,14 @@ fn pending_payout_with_no_treasury_returns_full_gross_and_zero_fee() {
 fn admin_functions_before_init_return_not_initialized() {
     let env = Env::default();
     env.mock_all_auths();
-    let contract_id = env.register(DonationVault, ());
+    let admin = Address::generate(&env);
+    let contract_id = env.register(DonationVault, DonationVaultArgs::__constructor(&admin));
     let client = DonationVaultClient::new(&env, &contract_id);
+
+    // Simulate uninitialized state where DataKey::Admin is missing
+    env.as_contract(&contract_id, || {
+        env.storage().instance().remove(&DataKey::Admin);
+    });
 
     let treasury = Address::generate(&env);
     let new_admin = Address::generate(&env);
@@ -2794,6 +2840,15 @@ fn double_init_fails_and_preserves_original_admin() {
 }
 
 #[test]
+#[should_panic]
+fn init_without_admin_auth_fails() {
+    let s = setup();
+    let attacker = Address::generate(&s.env);
+    s.env.mock_auths(&[]);
+    s.client.init(&attacker);
+}
+
+#[test]
 fn pause_blocks_top_up_without_mutating_stream_or_balances() {
     let s = setup();
     s.token_admin.mint(&s.donor, &2_000);
@@ -2946,6 +3001,123 @@ fn upgrade_preserves_state() {
     s.client.set_treasury(&treasury);
     s.client.set_fee_bps(&500);
     s.client.set_min_deposit(&100);
+// rescue_stream tests (issue #286)
+// =============================================================================
+
+#[test]
+fn rescue_stream_refunds_donor_and_updates_state_and_emits_event() {
+    let s = setup();
+    s.token_admin.mint(&s.donor, &1_000);
+
+    let stream_id = s
+        .client
+        .create_stream(&s.donor, &s.ngo, &s.token.address, &1_000, &10);
+
+    // Advance timestamp by 20 seconds: under normal cancel, 200 would accrue to the NGO.
+    s.env.ledger().with_mut(|l| l.timestamp += 20);
+
+    // Initial balances before rescue:
+    assert_eq!(s.token.balance(&s.donor), 0);
+    assert_eq!(s.token.balance(&s.client.address), 1_000);
+    assert_eq!(s.token.balance(&s.ngo), 0);
+
+    s.client.pause();
+
+    // Rescue the stream.
+    let refund = s.client.rescue_stream(&stream_id);
+    assert_eq!(refund, 1_000);
+
+    // Assert exact balances moved: full remaining balance refunded to donor, NGO gets nothing.
+    assert_eq!(s.token.balance(&s.donor), 1_000);
+    assert_eq!(s.token.balance(&s.client.address), 0);
+    assert_eq!(s.token.balance(&s.ngo), 0);
+
+    // Assert stream's resulting state.
+    let stream = s.client.get_stream(&stream_id);
+    assert_eq!(stream.balance, 0);
+    assert_eq!(stream.rate, 0);
+    assert!(stream.cancelled);
+    assert_eq!(stream.status, StreamStatus::Cancelled);
+    assert_eq!(stream.last_update, s.env.ledger().timestamp());
+    assert_eq!(stream.withdrawn, 0);
+
+    // Assert rescue event topics and data.
+    assert_last_event(&s.env, (symbol_short!("rescue"), stream_id), refund);
+    let evt = last_event(&s.env);
+    assert_eq!(
+        evt,
+        (
+            (symbol_short!("rescue"), stream_id).into_val(&s.env),
+            1_000i128.into_val(&s.env),
+        )
+    );
+}
+
+#[test]
+fn rescue_stream_when_not_paused_returns_not_paused() {
+    let s = setup();
+    s.token_admin.mint(&s.donor, &1_000);
+
+    let stream_id = s
+        .client
+        .create_stream(&s.donor, &s.ngo, &s.token.address, &1_000, &10);
+
+    // Vault is not paused; rescue must return Error::NotPaused.
+    let result = s.client.try_rescue_stream(&stream_id);
+    assert_eq!(result, Err(Ok(Error::NotPaused)));
+}
+
+#[test]
+fn rescue_stream_already_cancelled_returns_stream_cancelled() {
+    let s = setup();
+    s.token_admin.mint(&s.donor, &1_000);
+
+    let stream_id = s
+        .client
+        .create_stream(&s.donor, &s.ngo, &s.token.address, &1_000, &10);
+
+    // Donor cancels the stream first.
+    s.client.cancel_stream(&stream_id);
+
+    // Pause vault and try to rescue the cancelled stream.
+    s.client.pause();
+    let result = s.client.try_rescue_stream(&stream_id);
+    assert_eq!(result, Err(Ok(Error::StreamCancelled)));
+}
+
+#[test]
+fn rescue_stream_twice_returns_stream_cancelled() {
+    let s = setup();
+    s.token_admin.mint(&s.donor, &1_000);
+
+    let stream_id = s
+        .client
+        .create_stream(&s.donor, &s.ngo, &s.token.address, &1_000, &10);
+
+    s.client.pause();
+    let refund = s.client.rescue_stream(&stream_id);
+    assert_eq!(refund, 1_000);
+
+    // Second rescue attempt on the already rescued stream fails with StreamCancelled.
+    let result = s.client.try_rescue_stream(&stream_id);
+    assert_eq!(result, Err(Ok(Error::StreamCancelled)));
+}
+
+#[test]
+fn rescue_stream_unknown_id_returns_stream_not_found() {
+    let s = setup();
+    s.client.pause();
+
+    let unknown_id = 123456u64;
+    let result = s.client.try_rescue_stream(&unknown_id);
+    assert_eq!(result, Err(Ok(Error::StreamNotFound)));
+}
+
+#[test]
+#[should_panic]
+fn rescue_stream_fails_for_non_admin_caller() {
+    let s = setup();
+    s.token_admin.mint(&s.donor, &1_000);
 
     let stream_id = s
         .client
@@ -2964,3 +3136,35 @@ fn upgrade_preserves_state() {
     assert_eq!(config_before, config_after);
     assert_eq!(stream_before, stream_after);
 }
+    s.client.pause();
+
+    let non_admin = Address::generate(&s.env);
+    s.env.mock_auths(&[MockAuth {
+        address: &non_admin,
+        invoke: &MockAuthInvoke {
+            contract: &s.client.address,
+            fn_name: "rescue_stream",
+            args: (stream_id,).into_val(&s.env),
+            sub_invokes: &[],
+        },
+    }]);
+
+    s.client.rescue_stream(&stream_id);
+}
+
+#[test]
+#[should_panic]
+fn rescue_stream_fails_without_admin_auth() {
+    let s = setup();
+    s.token_admin.mint(&s.donor, &1_000);
+
+    let stream_id = s
+        .client
+        .create_stream(&s.donor, &s.ngo, &s.token.address, &1_000, &10);
+
+    s.client.pause();
+
+    s.env.mock_auths(&[]);
+    s.client.rescue_stream(&stream_id);
+}
+

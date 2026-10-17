@@ -517,23 +517,35 @@ pub struct DonationVault;
 
 #[contractimpl]
 impl DonationVault {
+    /// Initializes the vault admin and seeds the initial configuration atomically at deployment time.
+    pub fn __constructor(env: Env, admin: Address) {
+        env.storage().instance().set(&DataKey::Admin, &admin);
+        env.storage().instance().set(&DataKey::NextStreamId, &0u64);
+        env.storage().instance().set(&DataKey::MinDeposit, &0i128);
+        env.storage().instance().set(&DataKey::TotalDonated, &0i128);
+        env.storage()
+            .instance()
+            .set(&DataKey::CancelGraceLedgers, &0u32);
+        extend_instance_ttl(&env);
+    }
+
     /// Sets the vault admin and seeds the stream-id counter. Can only be called once.
+    /// Neutralized in favor of `__constructor` for atomic deployment; requires admin auth.
     ///
     /// # Examples
     ///
     /// ```rust,no_run
     /// # use soroban_sdk::{testutils::Address as _, Address, Env};
-    /// # use donation_vault::{DonationVault, DonationVaultClient};
+    /// # use donation_vault::{DonationVault, DonationVaultArgs, DonationVaultClient};
     /// let env = Env::default();
     /// env.mock_all_auths();
     ///
-    /// let contract_id = env.register(DonationVault, ());
-    /// let client = DonationVaultClient::new(&env, &contract_id);
-    ///
     /// let admin = Address::generate(&env);
-    /// client.init(&admin);
+    /// let contract_id = env.register(DonationVault, DonationVaultArgs::__constructor(&admin));
+    /// let client = DonationVaultClient::new(&env, &contract_id);
     /// ```
     pub fn init(env: Env, admin: Address) -> Result<(), Error> {
+        admin.require_auth();
         if admin_renounced(&env) {
             return Err(Error::AdminRenounced);
         }
