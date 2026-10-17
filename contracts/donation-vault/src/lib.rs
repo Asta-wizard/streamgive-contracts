@@ -46,11 +46,13 @@ pub struct CreatedEvent {
     pub rate: i128,
 }
 
-#[contractevent(topics = ["withdraw"], data_format = "single-value")]
+#[contractevent(topics = ["withdraw"], data_format = "vec")]
 pub struct WithdrawnEvent {
     #[topic]
     pub stream_id: u64,
     pub accrued: i128,
+    pub fee: i128,
+    pub net: i128,
 }
 
 #[contractevent(topics = ["cancel"], data_format = "vec")]
@@ -61,11 +63,12 @@ pub struct CancelledStreamEvent {
     pub refund: i128,
 }
 
-#[contractevent(topics = ["topup"], data_format = "single-value")]
+#[contractevent(topics = ["topup"], data_format = "vec")]
 pub struct ToppedUpEvent {
     #[topic]
     pub stream_id: u64,
     pub amount: i128,
+    pub settled: i128,
 }
 
 #[contractevent(topics = ["ratemod"], data_format = "vec")]
@@ -74,6 +77,16 @@ pub struct RateModifiedEvent {
     pub stream_id: u64,
     pub old_rate: i128,
     pub new_rate: i128,
+    pub settled: i128,
+}
+
+#[contractevent(topics = ["transfer"], data_format = "vec")]
+pub struct TransferStreamEvent {
+    #[topic]
+    pub stream_id: u64,
+    pub old_ngo: Address,
+    pub new_ngo: Address,
+    pub settled: i128,
 }
 
 #[contractevent(topics = ["treasset"], data_format = "single-value")]
@@ -1787,8 +1800,15 @@ impl DonationVault {
 
         let token_client = token::Client::new(&env, &stream.token);
         let net = pay_ngo(&env, &token_client, &stream.ngo, accrued);
+        let fee = accrued.checked_sub(net).unwrap_or(0);
 
-        WithdrawnEvent { stream_id, accrued }.publish(&env);
+        WithdrawnEvent {
+            stream_id,
+            accrued,
+            fee,
+            net,
+        }
+        .publish(&env);
 
         Ok(net)
     }
@@ -1904,7 +1924,24 @@ impl DonationVault {
         // topics and data so the indexer needs no batch-specific handling.
         for (stream_id, accrued) in stream_ids.iter().zip(amounts.iter()) {
             if accrued > 0 {
-                WithdrawnEvent { stream_id, accrued }.publish(&env);
+                let stream_key = DataKey::Stream(stream_id);
+                let fee = if let Some(st) = env
+                    .storage()
+                    .persistent()
+                    .get::<DataKey, Stream>(&stream_key)
+                {
+                    compute_fee(&env, &st.token, accrued)
+                } else {
+                    0
+                };
+                let net = accrued.checked_sub(fee).unwrap_or(0);
+                WithdrawnEvent {
+                    stream_id,
+                    accrued,
+                    fee,
+                    net,
+                }
+                .publish(&env);
             }
         }
 
@@ -2141,7 +2178,7 @@ impl DonationVault {
         let token_client = token::Client::new(&env, &stream.token);
 
         let now = env.ledger().timestamp();
-        let _accrued = settle(&env, &mut stream, now)?;
+        let settled = settle(&env, &mut stream, now)?;
 
         // Update state before the external token transfer
         stream.balance = stream
@@ -2165,7 +2202,12 @@ impl DonationVault {
         // External token transfer is the last step
         token_client.transfer(&stream.donor, &env.current_contract_address(), &amount);
 
-        ToppedUpEvent { stream_id, amount }.publish(&env);
+        ToppedUpEvent {
+            stream_id,
+            amount,
+            settled,
+        }
+        .publish(&env);
 
         Ok(())
     }
@@ -2225,7 +2267,7 @@ impl DonationVault {
         }
 
         let now = env.ledger().timestamp();
-        let _accrued = settle(&env, &mut stream, now)?;
+        let settled = settle(&env, &mut stream, now)?;
         stream.rate = new_rate;
 
         env.storage().persistent().set(&key, &stream);
@@ -2236,6 +2278,47 @@ impl DonationVault {
             stream_id,
             old_rate,
             new_rate,
+            settled,
+        }
+        .publish(&env);
+
+        Ok(())
+    }
+
+    /// Reassigns an ongoing stream to a different NGO. Donor-auth-gated.
+    /// Settles whatever has already accrued to the old NGO first, so future
+    /// accrual only flows to `new_ngo`. Emits a `transfer` event carrying
+    /// the old and new NGO addresses and the settled amount.
+    pub fn transfer_stream(env: Env, stream_id: u64, new_ngo: Address) -> Result<(), Error> {
+        require_not_paused(&env)?;
+
+        let key = DataKey::Stream(stream_id);
+        let mut stream: Stream = env
+            .storage()
+            .persistent()
+            .get(&key)
+            .ok_or(Error::StreamNotFound)?;
+
+        stream.donor.require_auth();
+
+        if stream.cancelled {
+            return Err(Error::StreamCancelled);
+        }
+
+        let old_ngo = stream.ngo.clone();
+        let now = env.ledger().timestamp();
+        let settled = settle(&env, &mut stream, now)?;
+        stream.ngo = new_ngo.clone();
+
+        env.storage().persistent().set(&key, &stream);
+        extend_instance_ttl(&env);
+        extend_stream_ttl(&env, stream_id);
+
+        TransferStreamEvent {
+            stream_id,
+            old_ngo,
+            new_ngo,
+            settled,
         }
         .publish(&env);
 

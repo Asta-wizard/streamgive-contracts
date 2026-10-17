@@ -155,7 +155,7 @@ fn full_lifecycle_create_accrue_withdraw_cancel() {
         withdrew,
         (
             (symbol_short!("withdraw"), stream_id).into_val(&s.env),
-            500i128.into_val(&s.env),
+            (500i128, 0i128, 500i128).into_val(&s.env),
         )
     );
     assert_eq!(s.token.balance(&s.ngo), 500);
@@ -272,7 +272,7 @@ fn top_up_and_modify_rate_settle_before_changing() {
         topped_up,
         (
             (symbol_short!("topup"), stream_id).into_val(&s.env),
-            500i128.into_val(&s.env),
+            (500i128, 100i128).into_val(&s.env),
         )
     );
     assert_eq!(s.token.balance(&s.ngo), 100);
@@ -286,7 +286,7 @@ fn top_up_and_modify_rate_settle_before_changing() {
     assert_last_event(
         &s.env,
         (symbol_short!("ratemod"), stream_id),
-        (10i128, 20i128),
+        (10i128, 20i128, 50i128),
     );
     let rate_changed = last_event(&s.env);
 
@@ -294,7 +294,7 @@ fn top_up_and_modify_rate_settle_before_changing() {
         rate_changed,
         (
             (symbol_short!("ratemod"), stream_id).into_val(&s.env),
-            (10i128, 20i128).into_val(&s.env),
+            (10i128, 20i128, 50i128).into_val(&s.env),
         )
     );
     assert_eq!(s.token.balance(&s.ngo), 150);
@@ -1402,6 +1402,105 @@ fn pending_payout_with_nonzero_fee_matches_actual_withdraw_split() {
     s.client.withdraw(&stream_id);
     assert_eq!(s.token.balance(&s.ngo), net);
     assert_eq!(s.token.balance(&treasury), fee);
+}
+
+#[test]
+fn withdraw_event_amounts_with_non_zero_fee() {
+    let s = setup();
+    s.token_admin.mint(&s.donor, &2_000);
+
+    let treasury = Address::generate(&s.env);
+    s.client.set_treasury(&treasury);
+    s.client.set_fee_bps(&500); // 5% global fee
+
+    let stream_id = s
+        .client
+        .create_stream(&s.donor, &s.ngo, &s.token.address, &1_000, &10);
+    s.env.ledger().with_mut(|l| l.timestamp += 50); // 500 gross accrues
+
+    let net = s.client.withdraw(&stream_id);
+    let withdrew = last_event(&s.env);
+
+    let gross: i128 = 500;
+    let fee: i128 = 25; // 500 * 500 / 10_000
+    assert_eq!(net, 475);
+    // net + fee == gross
+    assert_eq!(net + fee, gross);
+
+    assert_eq!(
+        withdrew,
+        (
+            (symbol_short!("withdraw"), stream_id).into_val(&s.env),
+            (gross, fee, net).into_val(&s.env),
+        )
+    );
+    assert_eq!(s.token.balance(&s.ngo), net);
+    assert_eq!(s.token.balance(&treasury), fee);
+}
+
+#[test]
+fn withdraw_event_amounts_with_token_fee_override() {
+    let s = setup();
+    s.token_admin.mint(&s.donor, &2_000);
+
+    let treasury = Address::generate(&s.env);
+    s.client.set_treasury(&treasury);
+    s.client.set_fee_bps(&500); // 5% global fee
+    s.client.set_token_fee_bps(&s.token.address, &200); // 2% token override
+
+    let stream_id = s
+        .client
+        .create_stream(&s.donor, &s.ngo, &s.token.address, &1_000, &10);
+    s.env.ledger().with_mut(|l| l.timestamp += 50); // 500 gross accrues
+
+    let net = s.client.withdraw(&stream_id);
+    let withdrew = last_event(&s.env);
+
+    let gross: i128 = 500;
+    let fee: i128 = 10; // 500 * 200 / 10_000
+    assert_eq!(net, 490);
+    // net + fee == gross
+    assert_eq!(net + fee, gross);
+
+    assert_eq!(
+        withdrew,
+        (
+            (symbol_short!("withdraw"), stream_id).into_val(&s.env),
+            (gross, fee, net).into_val(&s.env),
+        )
+    );
+    assert_eq!(s.token.balance(&s.ngo), net);
+    assert_eq!(s.token.balance(&treasury), fee);
+}
+
+#[test]
+fn withdraw_event_amounts_with_zero_fee() {
+    let s = setup();
+    s.token_admin.mint(&s.donor, &2_000);
+
+    // No treasury configured -> fee is 0
+    let stream_id = s
+        .client
+        .create_stream(&s.donor, &s.ngo, &s.token.address, &1_000, &10);
+    s.env.ledger().with_mut(|l| l.timestamp += 50); // 500 gross accrues
+
+    let net = s.client.withdraw(&stream_id);
+    let withdrew = last_event(&s.env);
+
+    let gross: i128 = 500;
+    let fee: i128 = 0;
+    assert_eq!(net, 500);
+    // net + fee == gross
+    assert_eq!(net + fee, gross);
+
+    assert_eq!(
+        withdrew,
+        (
+            (symbol_short!("withdraw"), stream_id).into_val(&s.env),
+            (gross, fee, net).into_val(&s.env),
+        )
+    );
+    assert_eq!(s.token.balance(&s.ngo), net);
 }
 
 #[test]
@@ -2621,7 +2720,7 @@ fn transfer_stream_emits_event_with_old_and_new_ngo() {
         transferred,
         (
             (symbol_short!("transfer"), stream_id).into_val(&s.env),
-            (s.ngo.clone(), new_ngo.clone()).into_val(&s.env),
+            (s.ngo.clone(), new_ngo.clone(), 0i128).into_val(&s.env),
         )
     );
 }

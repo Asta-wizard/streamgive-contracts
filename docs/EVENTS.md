@@ -192,18 +192,15 @@ since the last checkpoint.
 | | |
 |---|---|
 | Topics | `("withdraw", stream_id: u64)` |
-| Data | `accrued: i128` |
+| Data | `(accrued: i128, fee: i128, net: i128)` |
 
-`accrued` is the gross amount released from the stream's balance — if a
-protocol fee is configured (see `set_fee_bps`/`set_treasury`), the NGO
-actually receives `accrued` minus the fee, with the fee paid to the
-treasury in the same transaction. No separate fee event is emitted; derive
-the split from the vault's `fee_bps()`/`treasury()` at the time of the
-transaction.
+`accrued` is the gross amount released from the stream's balance. `fee` is the
+protocol fee paid to the treasury (or `0` if no treasury is set or the effective
+fee is 0%). `net` is the net amount actually transferred to the NGO. The
+invariant `accrued = fee + net` holds for every payout.
 
-The `withdraw` entry point **returns** that same net amount (gross minus
-fee), so a caller displaying the payout can use the return value directly;
-the event data stays gross, matching the stream's `withdrawn` bookkeeping.
+The `withdraw` entry point returns that same `net` amount, so callers displaying
+the payout receive the exact token units transferred to the NGO.
 
 ### `cancel`
 
@@ -226,10 +223,12 @@ Emitted by `top_up` when a donor adds more funds to an existing stream.
 | | |
 |---|---|
 | Topics | `("topup", stream_id: u64)` |
-| Data | `amount: i128` |
+| Data | `(amount: i128, settled: i128)` |
 
-`amount` is only the newly added deposit. Any balance already accrued at the time of the top-up is settled to the NGO first (as its own implicit
-payout, without emitting a `withdraw` event) before the deposit is added.
+`amount` is the newly added deposit. Any balance already accrued at the time of the
+top-up is settled to the NGO first (as its own implicit payout, without emitting a
+separate `withdraw` event) before the deposit is added; `settled` reports that gross
+settled amount.
 
 ### `ratemod`
 
@@ -239,12 +238,12 @@ rate.
 | | |
 |---|---|
 | Topics | `("ratemod", stream_id: u64)` |
-| Data | `(old_rate: i128, new_rate: i128)` |
+| Data | `(old_rate: i128, new_rate: i128, settled: i128)` |
 
 As with `top_up`, any balance already accrued at the old rate is settled to
-the NGO first, so the new rate only ever applies going forward. The event
-records both values so an indexer can calculate the change without another
-state query.
+the NGO first, so the new rate only ever applies going forward. `settled` reports
+the gross amount settled to the NGO at the old rate. The event records both rates
+so an indexer can calculate the change without another state query.
 
 ### `transfer`
 
@@ -254,13 +253,13 @@ different NGO.
 | | |
 |---|---|
 | Topics | `("transfer", stream_id: u64)` |
-| Data | `(old_ngo: Address, new_ngo: Address)` |
+| Data | `(old_ngo: Address, new_ngo: Address, settled: i128)` |
 
 Anything accrued to the old NGO before the transfer is settled to it as
 part of the call (subject to the same protocol-fee split as `withdraw`),
-without emitting a separate `withdraw` event. After this event, future
-accrual goes to the `new_ngo` in `data`. The donor and the stream's balance
-and rate are unchanged.
+without emitting a separate `withdraw` event; `settled` reports that gross
+amount settled to `old_ngo`. After this event, future accrual goes to the
+`new_ngo` in `data`. The donor and the stream's balance and rate are unchanged.
 
 ### `unregist`
 

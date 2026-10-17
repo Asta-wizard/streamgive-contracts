@@ -63,6 +63,13 @@ This project does not yet follow a formal versioning scheme — each contract's
 
 ### Changed
 
+- **BREAKING** `donation-vault`: updated event data payloads to include net, fee,
+  and settled amounts. `withdraw` now emits `(accrued: i128, fee: i128, net: i128)`
+  instead of single-value `accrued`; `topup` now emits `(amount: i128, settled: i128)`
+  instead of single-value `amount`; `ratemod` now emits `(old_rate: i128, new_rate: i128, settled: i128)`
+  instead of `(old_rate, new_rate)`; and `transfer` emits `(old_ngo: Address, new_ngo: Address, settled: i128)`
+  instead of `(old_ngo, new_ngo)`. Off-chain indexers and subscribers must update
+  their event decoders for these new data shapes.
 - `donation-vault`: `get_config` returns an extended `Config` struct that includes
   `min_deposit`, `max_streams_per_donor`, `registry`, `cancel_grace_ledgers`,
   `total_donated`, `pending_admin`, and `renounced`. Clients decoding the old
