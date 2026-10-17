@@ -1149,6 +1149,121 @@ fn set_token_fee_bps_emits_token_and_value() {
 }
 
 #[test]
+fn clear_token_fee_bps_requires_admin_auth() {
+    let s = setup();
+    let admin = s.client.admin();
+    s.client.clear_token_fee_bps(&s.token.address);
+    assert_auth_required_from(&s, &admin, "clear_token_fee_bps");
+
+    s.env.mock_auths(&[]);
+    let result = s.client.try_clear_token_fee_bps(&s.token.address);
+    assert!(result.is_err());
+}
+
+#[test]
+fn clear_token_fee_bps_restores_global_fee_on_withdraw() {
+    let s = setup();
+    s.token_admin.mint(&s.donor, &2_000);
+
+    let treasury = Address::generate(&s.env);
+    s.client.set_treasury(&treasury);
+    s.client.set_fee_bps(&500); // 5% global fee
+    s.client.set_token_fee_bps(&s.token.address, &100); // 1% token override
+
+    assert_eq!(s.client.token_fee_bps(&s.token.address), 100);
+
+    // Create stream and withdraw with override in effect
+    let stream_id = s
+        .client
+        .create_stream(&s.donor, &s.ngo, &s.token.address, &1_000, &10);
+    s.env.ledger().with_mut(|l| l.timestamp += 50); // 500 gross accrues
+    // 1% of 500 = 5 fee, 495 net
+    let net = s.client.withdraw(&stream_id);
+    assert_eq!(net, 495);
+    assert_eq!(s.token.balance(&s.ngo), 495);
+    assert_eq!(s.token.balance(&treasury), 5);
+
+    // Clear the token fee override
+    s.client.clear_token_fee_bps(&s.token.address);
+    // Getter reflects fallback to global 5%
+    assert_eq!(s.client.token_fee_bps(&s.token.address), 500);
+
+    // Withdraw again after clearing: global fee (5%) must apply to actual payout
+    s.env.ledger().with_mut(|l| l.timestamp += 50); // another 500 gross accrues
+    // 5% of 500 = 25 fee, 475 net
+    let net2 = s.client.withdraw(&stream_id);
+    assert_eq!(net2, 475);
+    assert_eq!(s.token.balance(&s.ngo), 495 + 475);
+    assert_eq!(s.token.balance(&treasury), 5 + 25);
+}
+
+#[test]
+fn clear_token_fee_bps_with_explicit_zero_override() {
+    let s = setup();
+    s.token_admin.mint(&s.donor, &2_000);
+
+    let treasury = Address::generate(&s.env);
+    s.client.set_treasury(&treasury);
+    s.client.set_fee_bps(&500); // 5% global fee
+    s.client.set_token_fee_bps(&s.token.address, &0); // 0% explicit override
+
+    assert_eq!(s.client.token_fee_bps(&s.token.address), 0);
+
+    let stream_id = s
+        .client
+        .create_stream(&s.donor, &s.ngo, &s.token.address, &1_000, &10);
+    s.env.ledger().with_mut(|l| l.timestamp += 50); // 500 gross accrues
+
+    // Explicit 0% override still gets 0% fee until cleared
+    let net = s.client.withdraw(&stream_id);
+    assert_eq!(net, 500);
+    assert_eq!(s.token.balance(&s.ngo), 500);
+    assert_eq!(s.token.balance(&treasury), 0);
+
+    // Now clear the override
+    s.client.clear_token_fee_bps(&s.token.address);
+    assert_eq!(s.client.token_fee_bps(&s.token.address), 500);
+
+    s.env.ledger().with_mut(|l| l.timestamp += 50); // 500 gross accrues
+    // Global 5% fee applies: 25 fee, 475 net
+    let net2 = s.client.withdraw(&stream_id);
+    assert_eq!(net2, 475);
+    assert_eq!(s.token.balance(&s.ngo), 500 + 475);
+    assert_eq!(s.token.balance(&treasury), 25);
+}
+
+#[test]
+fn clear_token_fee_bps_emits_event() {
+    let s = setup();
+    s.client.set_token_fee_bps(&s.token.address, &200);
+
+    s.client.clear_token_fee_bps(&s.token.address);
+
+    assert_eq!(
+        last_event(&s.env),
+        (
+            (symbol_short!("tokfeeclr"), s.token.address.clone()).into_val(&s.env),
+            ().into_val(&s.env),
+        )
+    );
+}
+
+#[test]
+fn clear_token_fee_bps_noop_when_no_override() {
+    let s = setup();
+    // No override configured for s.token.address
+    let result = s.client.try_clear_token_fee_bps(&s.token.address);
+    assert!(result.is_ok());
+
+    let treasury = Address::generate(&s.env);
+    s.client.set_treasury(&treasury);
+    let events_before = s.env.events().all().len();
+    s.client.clear_token_fee_bps(&s.token.address);
+    let events_after = s.env.events().all().len();
+    assert_eq!(events_before, events_after);
+}
+
+#[test]
 fn withdraw_uses_the_per_token_fee_override_instead_of_the_global_default() {
     let s = setup();
     s.token_admin.mint(&s.donor, &1_000);
@@ -2074,6 +2189,9 @@ fn admin_entry_points_require_admin_auth() {
 
     s.client.cancel_admin_proposal();
     assert_auth_required_from(&s, &admin, "cancel_admin_proposal");
+
+    s.client.clear_token_fee_bps(&s.token.address);
+    assert_auth_required_from(&s, &admin, "clear_token_fee_bps");
 }
 
 #[test]

@@ -93,6 +93,13 @@ pub struct TokenFeeBpsSetEvent {
     pub fee_bps: u32,
 }
 
+#[contractevent(topics = ["tokfeeclr"], data_format = "single-value")]
+pub struct TokenFeeBpsClearedEvent {
+    #[topic]
+    pub token: Address,
+    pub data: (),
+}
+
 #[contractevent(topics = ["maxstrm"], data_format = "single-value")]
 pub struct MaxStreamsPerDonorSetEvent {
     pub limit: u64,
@@ -1277,6 +1284,46 @@ impl DonationVault {
         extend_instance_ttl(&env);
 
         TokenFeeBpsSetEvent { token, fee_bps }.publish(&env);
+
+        Ok(())
+    }
+
+    /// Clears the fee override for `token`, causing subsequent payouts in
+    /// this token to fall back to the global `fee_bps`. Admin-gated.
+    ///
+    /// If no override was configured for `token`, this is a clean no-op
+    /// (consistent with `clear_treasury`), returning `Ok(())` without modifying
+    /// storage or emitting an event.
+    ///
+    /// # Examples
+    ///
+    /// ```rust,no_run
+    /// # use soroban_sdk::{testutils::Address as _, Address, Env};
+    /// # use donation_vault::{DonationVault, DonationVaultClient};
+    /// # let env = Env::default();
+    /// # env.mock_all_auths();
+    /// # let contract_id = env.register(DonationVault, ());
+    /// # let client = DonationVaultClient::new(&env, &contract_id);
+    /// # let admin = Address::generate(&env);
+    /// # client.init(&admin);
+    /// # let token = Address::generate(&env);
+    /// client.set_fee_bps(&500);
+    /// client.set_token_fee_bps(&token, &100);
+    /// assert_eq!(client.token_fee_bps(&token), 100);
+    ///
+    /// client.clear_token_fee_bps(&token);
+    /// assert_eq!(client.token_fee_bps(&token), 500);
+    /// ```
+    pub fn clear_token_fee_bps(env: Env, token: Address) -> Result<(), Error> {
+        require_admin(&env)?;
+        let key = DataKey::TokenFeeBps(token.clone());
+        if !env.storage().persistent().has(&key) {
+            return Ok(());
+        }
+        env.storage().persistent().remove(&key);
+        extend_instance_ttl(&env);
+
+        TokenFeeBpsClearedEvent { token, data: () }.publish(&env);
 
         Ok(())
     }

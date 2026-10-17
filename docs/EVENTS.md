@@ -13,9 +13,9 @@ layout stable. Event type names include `RegisterEvent`, `RenamedEvent`,
 `ApprovedEvent`, `RevokedEvent`, `UnregisteredEvent`, `ProposedAdminEvent`,
 `AcceptedAdminEvent`, `CancelledAdminEvent`, `PausedEvent`, `UnpausedEvent`,
 `TreasurySetEvent`, `FeeBpsSetEvent`, `TokenFeeBpsSetEvent`,
-`MaxStreamsPerDonorSetEvent`, `CreatedEvent`, `WithdrawnEvent`,
-`CancelledStreamEvent`, `RescuedStreamEvent`, `ToppedUpEvent`, and
-`RateModifiedEvent`.
+`TokenFeeBpsClearedEvent`, `MaxStreamsPerDonorSetEvent`, `CreatedEvent`,
+`WithdrawnEvent`, `CancelledStreamEvent`, `RescuedStreamEvent`, `ToppedUpEvent`,
+and `RateModifiedEvent`.
 
 - **Topics** â€” a tuple, always starting with a `Symbol` naming the event.
   Topics are indexed/filterable.
@@ -133,6 +133,30 @@ with `FeeTooHigh` and emit nothing. The event carries the full new value
 "Accepted" here means stored, not effective: the fee only affects payouts
 once a treasury is set, so pair this with `set_treasury`/`treasury()` when
 deriving an actual split.
+
+### `tokfeeset`
+
+Emitted by `set_token_fee_bps` when an admin configures a per-token fee override.
+
+| | |
+|---|---|
+| Topics | `("tokfeeset", token: Address)` |
+| Data | `fee_bps: u32` (the token fee override, in basis points) |
+
+The override takes precedence over the global `fee_bps` for streams using this token.
+An explicit override of `0` means zero fees for this token even when a global fee is set.
+
+### `tokfeeclr`
+
+Emitted by `clear_token_fee_bps` when an admin removes a per-token fee override.
+
+| | |
+|---|---|
+| Topics | `("tokfeeclr", token: Address)` |
+| Data | `()` (no payload) |
+
+After clearing, streams using this token fall back to the global `fee_bps` setting.
+If no override existed for the token, the call is a clean no-op and no event is emitted.
 
 ### `treasset`
 

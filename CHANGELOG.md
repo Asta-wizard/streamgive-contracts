@@ -18,6 +18,8 @@ This project does not yet follow a formal versioning scheme — each contract's
 - `donation-vault`: admin-gated `pause` / `unpause` for fund-moving actions.
 - `donation-vault`: optional protocol fee (`set_fee_bps` / `fee_bps`) with
   treasury payout (`set_treasury` / `treasury`).
+- `donation-vault`: `clear_token_fee_bps` to remove a per-token fee override,
+  restoring the global fee. Emits `tokfeeclr`.
 - `donation-vault`: emit `treasset` event on `set_treasury` so off-chain
   indexers can track protocol fee destination changes.
 - `donation-vault`: admin-configurable `cancel_grace_ledgers` retention for
